@@ -175,13 +175,34 @@ await client.send_video_message(chat_id, "circle.mp4")
 >
 > **Голосовые:** загружаются как файл, но отправляются с типом `AUDIO`. Рекомендуемый формат — OGG Opus или MP3.
 
-#### Контакты и поиск
+#### Пользователи и поиск
 
 | Метод | Описание |
 |-------|----------|
-| `get_contacts(contact_ids)` | Информация о контактах по ID |
-| `search(query, count=30, search_type="ALL")` | Поиск контактов и чатов |
+| `get_user(user_id)` | Получить инфу о пользователе по ID (имя, телефон, аватар, ник) |
+| `get_contacts(contact_ids)` | Получить инфу о нескольких пользователях разом |
+| `get_chat_members(chat_id)` | Получить инфу обо всех участниках чата |
+| `find_user(query)` | Поиск пользователей по имени, нику или телефону |
+| `search(query, count=30, search_type="ALL")` | Поиск контактов и чатов (низкоуровневый) |
 | `get_reactions(chat_id, message_ids)` | Реакции на сообщения |
+
+```python
+# Получить инфу о пользователе
+user = await client.get_user(6725252)
+print(user["names"][0]["name"])  # имя
+print(user.get("phone"))         # телефон (если доступен)
+print(user.get("link"))          # ссылка на профиль
+
+# Все участники чата
+members = await client.get_chat_members(13796912)
+for m in members:
+    print(f'{m["id"]}: {m["names"][0]["name"]}')
+
+# Поиск по имени/нику
+results = await client.find_user("Влад")
+for r in results:
+    print(r)
+```
 
 #### Медиа
 

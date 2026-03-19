@@ -675,21 +675,72 @@ class MaxClient:
             "sync": sync,
         })
 
-    # ── Contacts ────────────────────────────────────────────────
+    # ── Contacts & Users ──────────────────────────────────────
 
     async def get_contacts(self, contact_ids: list[int]) -> list[dict]:
-        """Get contact info by IDs."""
+        """Get contact info by IDs.
+
+        Returns list of contacts with fields like:
+            id, names, phone, link, options, avatar, etc.
+        """
         result = await self._request(
             Opcode.GET_CONTACTS, {"contactIds": contact_ids}
         )
         return result.get("contacts", [])
+
+    async def get_user(self, user_id: int) -> dict | None:
+        """Get info about a single user by ID.
+
+        Args:
+            user_id: MAX user ID (external ID).
+
+        Returns:
+            User dict or None if not found.
+        """
+        contacts = await self.get_contacts([user_id])
+        return contacts[0] if contacts else None
+
+    async def get_chat_members(self, chat_id: int) -> list[dict]:
+        """Get info about all participants in a chat.
+
+        Args:
+            chat_id: Chat ID.
+
+        Returns:
+            List of user info dicts for all chat participants.
+        """
+        chats = await self.get_chats(chat_ids=[chat_id])
+        if not chats:
+            return []
+        participants = chats[0].get("participants", {})
+        user_ids = [int(uid) for uid in participants.keys()]
+        if not user_ids:
+            return []
+        return await self.get_contacts(user_ids)
+
+    async def find_user(self, query: str) -> list[dict]:
+        """Search for users by name, nickname, or phone.
+
+        Args:
+            query: Search string (name, @nickname, phone number).
+
+        Returns:
+            List of matching user dicts.
+        """
+        return await self.search(query, search_type="CONTACT")
 
     # ── Search ──────────────────────────────────────────────────
 
     async def search(
         self, query: str, count: int = 30, search_type: str = "ALL"
     ) -> list[dict]:
-        """Search contacts and chats."""
+        """Search contacts and chats.
+
+        Args:
+            query: Search string.
+            count: Max results.
+            search_type: "ALL", "CONTACT", "CHAT", or "GROUP".
+        """
         result = await self._request(Opcode.SEARCH, {
             "query": query,
             "count": count,
