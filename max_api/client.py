@@ -33,13 +33,19 @@ class MaxClient:
             await client.send_message(chat_id, "Hello!")
     """
 
-    def __init__(self):
+    def __init__(self, token_refresh_interval: int = 600):
+        """
+        Args:
+            token_refresh_interval: Seconds between automatic token refreshes. Default 600 (10 min).
+        """
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._seq = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._device_id = str(uuid.uuid4())
         self._token: Optional[str] = None
         self._recv_task: Optional[asyncio.Task] = None
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_interval = token_refresh_interval
         self._handlers: dict[int, list[Callable]] = {}
 
     async def __aenter__(self):
@@ -63,6 +69,12 @@ class MaxClient:
         await self._send_init()
 
     async def disconnect(self):
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
         if self._recv_task:
             self._recv_task.cancel()
             try:
@@ -125,13 +137,14 @@ class MaxClient:
             try:
                 result = await self.login(saved)
                 print("Logged in with saved token.")
-                # Refresh token in background for next time
+                # Refresh token immediately + start background refresh
                 try:
                     refresh = await self.refresh_token()
                     if "token" in refresh:
                         save_token(refresh["token"])
                 except Exception:
                     pass
+                self._start_token_refresh_loop()
                 return result
             except MaxAPIError:
                 print("Saved token expired. Starting QR login...")
@@ -149,6 +162,7 @@ class MaxClient:
         token = await self._login_qr(password_callback, show_qr=show_qr)
         save_token(token)
         print("Token saved. Next login will be automatic.")
+        self._start_token_refresh_loop()
         return await self._request(Opcode.PING, {"interactive": True})
 
     async def _login_qr(
@@ -215,6 +229,24 @@ class MaxClient:
             self._token = result["token"]
             save_token(result["token"])
         return result
+
+    def _start_token_refresh_loop(self):
+        """Start background task that refreshes the token periodically."""
+        if self._refresh_task:
+            self._refresh_task.cancel()
+        self._refresh_task = asyncio.create_task(self._token_refresh_loop())
+
+    async def _token_refresh_loop(self):
+        """Background loop: refresh token every N seconds to keep session alive."""
+        try:
+            while True:
+                await asyncio.sleep(self._refresh_interval)
+                try:
+                    await self.refresh_token()
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
 
     async def logout(self):
         """Disconnect and clear saved token."""
