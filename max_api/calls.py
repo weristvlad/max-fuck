@@ -70,13 +70,8 @@ class MaxCall:
         self._player: Optional[MediaPlayer] = None
         self._recorder: Optional[MediaRecorder] = None
 
-    async def start(self, audio_only: bool = True):
-        """Connect to signaling server and start the WebRTC call.
-
-        Args:
-            audio_only: If True, only send/receive audio (no video).
-        """
-        # Configure ICE servers
+    def _setup_peer_connection(self):
+        """Configure RTCPeerConnection with ICE servers and event handlers."""
         ice_servers = []
         if self._stun_config.get("urls"):
             urls = self._stun_config["urls"]
@@ -96,7 +91,6 @@ class MaxCall:
         config = RTCConfiguration(iceServers=ice_servers)
         self._pc = RTCPeerConnection(configuration=config)
 
-        # Handle incoming tracks
         @self._pc.on("track")
         def on_track(track):
             print(f"[Call] Received remote {track.kind} track")
@@ -122,6 +116,38 @@ class MaxCall:
             if candidate:
                 await self._send_ice_candidate(candidate)
 
+    async def _connect_signaling_and_offer(self):
+        """Connect to signaling WS, wait for server, send SDP offer."""
+        self._ws = await websockets.connect(
+            self._signaling_url,
+            additional_headers={
+                "Origin": "https://web.max.ru",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/146.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        self._recv_task = asyncio.create_task(self._recv_loop())
+
+        print("[Call] Waiting for signaling server...")
+        await asyncio.wait_for(self._signaling_ready.wait(), timeout=10)
+
+        offer = await self._pc.createOffer()
+        await self._pc.setLocalDescription(offer)
+        await self._send_sdp_offer(offer)
+
+        print(f"[Call] SDP offer sent to participant {self._participant_id}, waiting for answer...")
+
+    async def start(self, audio_only: bool = True):
+        """Connect to signaling server and start the WebRTC call.
+
+        Args:
+            audio_only: If True, only send/receive audio (no video).
+        """
+        self._setup_peer_connection()
+
         # Add local audio track
         if self._audio_input:
             self._player = MediaPlayer(self._audio_input)
@@ -143,7 +169,6 @@ class MaxCall:
         if self._player and self._player.audio:
             self._pc.addTrack(self._player.audio)
         else:
-            # Add a silent audio track as fallback
             from aiortc.mediastreams import AudioStreamTrack
             self._pc.addTrack(AudioStreamTrack())
 
@@ -151,30 +176,31 @@ class MaxCall:
             if self._player and self._player.video:
                 self._pc.addTrack(self._player.video)
 
-        # Connect to signaling WebSocket
-        self._ws = await websockets.connect(
-            self._signaling_url,
-            additional_headers={
-                "Origin": "https://web.max.ru",
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/146.0.0.0 Safari/537.36"
-                ),
-            },
-        )
-        self._recv_task = asyncio.create_task(self._recv_loop())
+        await self._connect_signaling_and_offer()
 
-        # Wait for connection notification (gives us participant IDs)
-        print("[Call] Waiting for signaling server...")
-        await asyncio.wait_for(self._signaling_ready.wait(), timeout=10)
+    async def start_with_custom_media(self):
+        """Start call with pre-configured media players.
 
-        # Create and send SDP offer
-        offer = await self._pc.createOffer()
-        await self._pc.setLocalDescription(offer)
-        await self._send_sdp_offer(offer)
+        Set self._player (audio) and self._image_player (video) before calling.
+        Uses audio from self._player and video from self._image_player.
+        """
+        self._setup_peer_connection()
 
-        print(f"[Call] SDP offer sent to participant {self._participant_id}, waiting for answer...")
+        # Add audio track from player
+        if self._player and self._player.audio:
+            self._pc.addTrack(self._player.audio)
+            print("[Call] Added audio track from player")
+        else:
+            from aiortc.mediastreams import AudioStreamTrack
+            self._pc.addTrack(AudioStreamTrack())
+            print("[Call] Added silent audio track (no audio source)")
+
+        # Add video track from image player
+        if hasattr(self, '_image_player') and self._image_player and self._image_player.video:
+            self._pc.addTrack(self._image_player.video)
+            print("[Call] Added video track from image player")
+
+        await self._connect_signaling_and_offer()
 
     async def wait(self, timeout: float | None = None):
         """Wait until the call ends.
@@ -206,6 +232,34 @@ class MaxCall:
         print("[Call] Call ended.")
 
     # ── Signaling protocol ──────────────────────────────────
+
+    async def _handle_remote_data(self, data: dict):
+        """Handle SDP answer and ICE candidates from remote participant."""
+        # SDP answer from remote
+        if "sdp" in data:
+            sdp = data["sdp"]
+            print(f"[Call] Received SDP {sdp['type']}")
+            answer = RTCSessionDescription(
+                sdp=sdp["sdp"], type=sdp["type"]
+            )
+            await self._pc.setRemoteDescription(answer)
+            print("[Call] Remote description set!")
+
+        # ICE candidate from remote
+        if "candidate" in data:
+            c = data["candidate"]
+            candidate_str = c.get("candidate", "")
+            if candidate_str:
+                try:
+                    candidate = _parse_ice_candidate(
+                        candidate_str,
+                        c.get("sdpMid", "0"),
+                        c.get("sdpMLineIndex", 0),
+                    )
+                    if candidate:
+                        await self._pc.addIceCandidate(candidate)
+                except Exception as e:
+                    print(f"[Call] Failed to add ICE candidate: {e}")
 
     async def _send_sdp_offer(self, offer: RTCSessionDescription):
         """Send SDP offer to remote participant."""
@@ -291,6 +345,9 @@ class MaxCall:
                     elif notification == "participant-joined":
                         print("[Call] Participant joined the call")
 
+                    elif notification == "accepted-call":
+                        print("[Call] Call answered!")
+
                     elif notification == "participant-left":
                         print("[Call] Participant left the call")
                         self._ended.set()
@@ -299,38 +356,27 @@ class MaxCall:
                         print("[Call] Call ended by server")
                         self._ended.set()
 
+                    elif notification == "transmitted-data":
+                        # Remote participant's data relayed through server
+                        data = msg.get("data", {})
+                        await self._handle_remote_data(data)
+
+                    elif notification in (
+                        "media-settings-changed",
+                        "topology-changed",
+                    ):
+                        print(f"[Call] {notification}")
+
                     else:
                         print(f"[Call] Notification: {notification}")
 
                 elif command == "transmit-data":
                     data = msg.get("data", {})
+                    await self._handle_remote_data(data)
 
-                    # SDP answer from remote
-                    if "sdp" in data:
-                        sdp = data["sdp"]
-                        print(f"[Call] Received SDP {sdp['type']}")
-                        answer = RTCSessionDescription(
-                            sdp=sdp["sdp"], type=sdp["type"]
-                        )
-                        await self._pc.setRemoteDescription(answer)
-                        print("[Call] Remote description set")
-
-                    # ICE candidate from remote
-                    if "candidate" in data:
-                        c = data["candidate"]
-                        candidate_str = c.get("candidate", "")
-                        if candidate_str:
-                            # Parse the candidate string for aiortc
-                            try:
-                                candidate = _parse_ice_candidate(
-                                    candidate_str,
-                                    c.get("sdpMid", "0"),
-                                    c.get("sdpMLineIndex", 0),
-                                )
-                                if candidate:
-                                    await self._pc.addIceCandidate(candidate)
-                            except Exception as e:
-                                print(f"[Call] Failed to add ICE candidate: {e}")
+                elif msg.get("response") == "transmit-data":
+                    # Server ACK for our transmit-data, ignore
+                    pass
 
                 else:
                     print(f"[Call] Unknown message: {json.dumps(msg)[:200]}")

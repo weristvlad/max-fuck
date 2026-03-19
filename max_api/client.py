@@ -740,7 +740,15 @@ class MaxClient:
         signaling_url = caller_params["endpoint"]
         turn_config = caller_params.get("turn", {})
         stun_config = caller_params.get("stun", {})
-        my_internal_id = caller_params.get("id.internal", 0)
+        id_obj = caller_params.get("id", {})
+        my_internal_id = id_obj.get("internal", 0) if isinstance(id_obj, dict) else 0
+
+        # Add required URL params if missing (matching web client behavior)
+        if "&platform=" not in signaling_url:
+            signaling_url += (
+                "&platform=WEB&appVersion=1.1&version=5"
+                "&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
+            )
 
         print(f"[Call] Conversation: {result['conversationId']}")
         print(f"[Call] Signaling: {signaling_url[:80]}...")
