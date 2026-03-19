@@ -75,6 +75,12 @@ class MaxClient:
                 await self._refresh_task
             except asyncio.CancelledError:
                 pass
+        # Refresh token one last time before closing so it stays fresh for next run
+        if self._ws and self._token:
+            try:
+                await self.refresh_token()
+            except Exception:
+                pass
         if self._recv_task:
             self._recv_task.cancel()
             try:
@@ -139,9 +145,7 @@ class MaxClient:
                 print("Logged in with saved token.")
                 # Refresh token immediately + start background refresh
                 try:
-                    refresh = await self.refresh_token()
-                    if "token" in refresh:
-                        save_token(refresh["token"])
+                    await self.refresh_token()
                 except Exception:
                     pass
                 self._start_token_refresh_loop()
@@ -223,11 +227,15 @@ class MaxClient:
         return token
 
     async def refresh_token(self) -> dict:
-        """Refresh the session token. Also saves to disk."""
+        """Refresh the session token. Also saves to disk with TTL info."""
         result = await self._request(Opcode.TOKEN_REFRESH, {})
         if "token" in result:
             self._token = result["token"]
-            save_token(result["token"])
+            save_token(
+                result["token"],
+                lifetime_ts=result.get("token_lifetime_ts"),
+                refresh_ts=result.get("token_refresh_ts"),
+            )
         return result
 
     def _start_token_refresh_loop(self):
