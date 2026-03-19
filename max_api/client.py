@@ -5,6 +5,7 @@ import getpass
 import json
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import websockets
@@ -15,6 +16,11 @@ from .opcodes import Cmd, Opcode
 WS_URL = "wss://ws-api.oneme.ru/websocket"
 PROTOCOL_VERSION = 11
 APP_VERSION = "26.3.7"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/146.0.0.0 Safari/537.36"
+)
 
 
 class MaxClient:
@@ -50,11 +56,7 @@ class MaxClient:
             WS_URL,
             additional_headers={
                 "Origin": "https://web.max.ru",
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/146.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": USER_AGENT,
             },
         )
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -78,11 +80,7 @@ class MaxClient:
                 "deviceLocale": "en",
                 "osVersion": "macOS",
                 "deviceName": "Chrome",
-                "headerUserAgent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/146.0.0.0 Safari/537.36"
-                ),
+                "headerUserAgent": USER_AGENT,
                 "appVersion": APP_VERSION,
                 "screen": "982x1512 2.0x",
                 "timezone": "Asia/Barnaul",
@@ -263,6 +261,34 @@ class MaxClient:
         result = await self._request(Opcode.GET_MESSAGES, payload)
         return result.get("messages", [])
 
+    async def get_media_messages(
+        self,
+        chat_id: int,
+        message_id: str,
+        attach_types: list[str] | None = None,
+        forward: int = 25,
+        backward: int = 25,
+    ) -> list[dict]:
+        """Get media messages around a given message, filtered by type.
+
+        Args:
+            chat_id: Chat ID.
+            message_id: Message ID to fetch around.
+            attach_types: Filter by attach types, e.g. ["PHOTO", "VIDEO"]. Default: ["PHOTO", "VIDEO"].
+            forward: Number of messages after.
+            backward: Number of messages before.
+        """
+        if attach_types is None:
+            attach_types = ["PHOTO", "VIDEO"]
+        result = await self._request(Opcode.GET_MEDIA_MESSAGES, {
+            "chatId": chat_id,
+            "messageId": message_id,
+            "attachTypes": attach_types,
+            "forward": forward,
+            "backward": backward,
+        })
+        return result.get("messages", [])
+
     async def send_message(
         self,
         chat_id: int,
@@ -308,6 +334,294 @@ class MaxClient:
             "type": "TEXT",
         })
 
+    # ── File / Photo / Video uploads ─────────────────────────────
+
+    async def _get_image_upload_url(self) -> str:
+        """Get a signed URL for uploading an image to iu.oneme.ru."""
+        result = await self._request(Opcode.GET_IMAGE_UPLOAD_URL, {"count": 1})
+        return result["url"]
+
+    async def _get_file_upload_url(self) -> dict:
+        """Get a signed URL + fileId for uploading a file to fu.oneme.ru.
+
+        Returns:
+            dict with keys: url, fileId, token
+        """
+        result = await self._request(Opcode.GET_FILE_UPLOAD_URL, {"count": 1})
+        return result["info"][0]
+
+    async def _upload_image(self, file_path: str | Path) -> str:
+        """Upload an image and return its photoToken.
+
+        Args:
+            file_path: Path to image file (png, jpg, webp, etc.)
+
+        Returns:
+            photoToken string to use in send_photo().
+        """
+        import aiohttp
+
+        file_path = Path(file_path)
+        upload_url = await self._get_image_upload_url()
+
+        async with aiohttp.ClientSession() as session:
+            data = aiohttp.FormData()
+            data.add_field(
+                "file",
+                file_path.read_bytes(),
+                filename=file_path.name,
+                content_type=_guess_mime(file_path),
+            )
+            async with session.post(
+                upload_url,
+                data=data,
+                headers={"Origin": "https://web.max.ru"},
+            ) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+
+        # Response: {"photos": {"<photoId>": {"token": "..."}}}
+        photos = result["photos"]
+        token = next(iter(photos.values()))["token"]
+        return token
+
+    async def _upload_file(self, file_path: str | Path) -> dict:
+        """Upload a file and return its fileId.
+
+        Args:
+            file_path: Path to any file.
+
+        Returns:
+            dict with fileId and token.
+        """
+        import aiohttp
+
+        file_path = Path(file_path)
+        info = await self._get_file_upload_url()
+        file_data = file_path.read_bytes()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                info["url"],
+                data=file_data,
+                headers={
+                    "Origin": "https://web.max.ru",
+                    "Content-Type": _guess_mime(file_path),
+                    "Content-Disposition": f"attachment; filename={file_path.name}",
+                    "Content-Range": f"0-{len(file_data) - 1}/{len(file_data)}",
+                },
+            ) as resp:
+                resp.raise_for_status()
+
+        # Confirm upload
+        await self._request(Opcode.CHECK_FILE_UPLOAD, {"fileId": info["fileId"]})
+        return {"fileId": info["fileId"], "token": info["token"]}
+
+    async def send_photo(
+        self,
+        chat_id: int,
+        file_path: str | Path,
+        text: str | None = None,
+        reply_to: str | None = None,
+    ) -> dict:
+        """Upload and send a photo.
+
+        Args:
+            chat_id: Chat ID.
+            file_path: Path to image file.
+            text: Optional caption text.
+            reply_to: Message ID to reply to (optional).
+        """
+        token = await self._upload_image(file_path)
+        cid = -int(time.time() * 1000)
+        msg: dict[str, Any] = {
+            "cid": cid,
+            "attaches": [{"_type": "PHOTO", "photoToken": token}],
+        }
+        if text:
+            msg["text"] = text
+            msg["elements"] = []
+        if reply_to:
+            msg["replyToMessageId"] = reply_to
+
+        return await self._request(Opcode.SEND_MESSAGE, {
+            "chatId": chat_id,
+            "message": msg,
+            "notify": True,
+        })
+
+    async def send_file(
+        self,
+        chat_id: int,
+        file_path: str | Path,
+        text: str | None = None,
+        reply_to: str | None = None,
+    ) -> dict:
+        """Upload and send a file.
+
+        Args:
+            chat_id: Chat ID.
+            file_path: Path to file.
+            text: Optional caption text.
+            reply_to: Message ID to reply to (optional).
+        """
+        info = await self._upload_file(file_path)
+        cid = -int(time.time() * 1000)
+        msg: dict[str, Any] = {
+            "cid": cid,
+            "attaches": [{"_type": "FILE", "fileId": info["fileId"]}],
+        }
+        if text:
+            msg["text"] = text
+            msg["elements"] = []
+        if reply_to:
+            msg["replyToMessageId"] = reply_to
+
+        return await self._request(Opcode.SEND_MESSAGE, {
+            "chatId": chat_id,
+            "message": msg,
+            "notify": True,
+        })
+
+    async def send_voice(
+        self,
+        chat_id: int,
+        file_path: str | Path,
+        duration_ms: int | None = None,
+        reply_to: str | None = None,
+    ) -> dict:
+        """Upload and send a voice message.
+
+        The file should ideally be in OGG Opus or MP3 format.
+        Uses the file upload endpoint (fu.oneme.ru).
+
+        Args:
+            chat_id: Chat ID.
+            file_path: Path to audio file.
+            duration_ms: Duration in milliseconds. If None, you should provide it.
+            reply_to: Message ID to reply to (optional).
+        """
+        info = await self._upload_file(file_path)
+        cid = -int(time.time() * 1000)
+        attach: dict[str, Any] = {
+            "_type": "AUDIO",
+            "fileId": info["fileId"],
+        }
+        if duration_ms is not None:
+            attach["duration"] = duration_ms
+        msg: dict[str, Any] = {
+            "cid": cid,
+            "attaches": [attach],
+        }
+        if reply_to:
+            msg["replyToMessageId"] = reply_to
+
+        return await self._request(Opcode.SEND_MESSAGE, {
+            "chatId": chat_id,
+            "message": msg,
+            "notify": True,
+        })
+
+    async def send_video(
+        self,
+        chat_id: int,
+        file_path: str | Path,
+        text: str | None = None,
+        reply_to: str | None = None,
+    ) -> dict:
+        """Upload and send a video.
+
+        Uses the file upload endpoint (fu.oneme.ru).
+
+        Args:
+            chat_id: Chat ID.
+            file_path: Path to video file (mp4).
+            text: Optional caption text.
+            reply_to: Message ID to reply to (optional).
+        """
+        info = await self._upload_file(file_path)
+        cid = -int(time.time() * 1000)
+        msg: dict[str, Any] = {
+            "cid": cid,
+            "attaches": [{"_type": "VIDEO", "fileId": info["fileId"]}],
+        }
+        if text:
+            msg["text"] = text
+            msg["elements"] = []
+        if reply_to:
+            msg["replyToMessageId"] = reply_to
+
+        return await self._request(Opcode.SEND_MESSAGE, {
+            "chatId": chat_id,
+            "message": msg,
+            "notify": True,
+        })
+
+    async def send_video_message(
+        self,
+        chat_id: int,
+        file_path: str | Path,
+        reply_to: str | None = None,
+    ) -> dict:
+        """Upload and send a video message (kruzhok / circle video).
+
+        The video should ideally be 480x480 square, short duration.
+        Uses the file upload endpoint (fu.oneme.ru).
+
+        Args:
+            chat_id: Chat ID.
+            file_path: Path to video file (mp4, square 480x480).
+            reply_to: Message ID to reply to (optional).
+        """
+        info = await self._upload_file(file_path)
+        cid = -int(time.time() * 1000)
+        msg: dict[str, Any] = {
+            "cid": cid,
+            "attaches": [{
+                "_type": "VIDEO",
+                "fileId": info["fileId"],
+                "videoType": 1,
+            }],
+        }
+        if reply_to:
+            msg["replyToMessageId"] = reply_to
+
+        return await self._request(Opcode.SEND_MESSAGE, {
+            "chatId": chat_id,
+            "message": msg,
+            "notify": True,
+        })
+
+    # ── Stickers ─────────────────────────────────────────────────
+
+    async def get_sticker_sets(
+        self, section_id: str = "NEW_STICKER_SETS", offset: int = 0, count: int = 100
+    ) -> dict:
+        """Get list of sticker set IDs.
+
+        Args:
+            section_id: Section to fetch. Default "NEW_STICKER_SETS".
+            offset: Pagination offset.
+            count: Number of sets to return.
+        """
+        return await self._request(Opcode.GET_STICKER_SETS, {
+            "sectionId": section_id,
+            "from": offset,
+            "count": count,
+        })
+
+    async def sync_stickers(self, sticker_type: str = "STICKER", sync: int = 0) -> dict:
+        """Sync sticker data.
+
+        Args:
+            sticker_type: "STICKER", "FAVORITE_STICKER", or "ANIMOJI".
+            sync: Sync marker (0 for full sync).
+        """
+        return await self._request(Opcode.STICKER_SYNC, {
+            "type": sticker_type,
+            "sync": sync,
+        })
+
     # ── Contacts ────────────────────────────────────────────────
 
     async def get_contacts(self, contact_ids: list[int]) -> list[dict]:
@@ -341,6 +655,85 @@ class MaxClient:
             "messageIds": message_ids,
         })
 
+    # ── Calls ──────────────────────────────────────────────────
+
+    async def get_call_history(self, count: int = 100) -> dict:
+        """Get call history.
+
+        Args:
+            count: Number of calls to fetch.
+
+        Returns:
+            dict with 'history' list of call records.
+        """
+        return await self._request(Opcode.GET_CALL_HISTORY, {
+            "forward": False,
+            "count": count,
+        })
+
+    async def initiate_call(
+        self, user_ids: list[int], is_video: bool = False
+    ) -> dict:
+        """Initiate an outgoing call.
+
+        Args:
+            user_ids: List of user IDs to call.
+            is_video: True for video call, False for audio.
+
+        Returns:
+            dict with conversationId and WebRTC connection params.
+        """
+        conversation_id = str(uuid.uuid4()).upper()
+        return await self._request(Opcode.INITIATE_CALL, {
+            "conversationId": conversation_id,
+            "calleeIds": user_ids,
+            "internalParams": json.dumps({
+                "deviceId": self._device_id,
+                "sdkVersion": "2.8.10-beta.5",
+                "clientAppKey": "CNHIJPLGDIHBABABA",
+                "platform": "WEB",
+                "protocolVersion": 5,
+                "capabilities": "2A03F",
+            }),
+            "isVideo": is_video,
+        })
+
+    # ── Chat state ─────────────────────────────────────────────
+
+    async def subscribe_chat(self, chat_id: int, subscribe: bool = True) -> dict:
+        """Subscribe/unsubscribe to real-time events for a chat."""
+        return await self._request(Opcode.SUBSCRIBE_CHAT, {
+            "chatId": chat_id,
+            "subscribe": subscribe,
+        })
+
+    # ── Media ──────────────────────────────────────────────────
+
+    async def get_video_url(
+        self,
+        video_id: int,
+        token: str,
+        chat_id: int,
+        message_id: str,
+    ) -> dict:
+        """Get playable video URL from CDN.
+
+        Args:
+            video_id: Video ID from message attach.
+            token: Token from message attach.
+            chat_id: Chat ID containing the message.
+            message_id: Message ID containing the video.
+
+        Returns:
+            dict with video URLs by quality (MP4_480, MP4_720, etc.)
+        """
+        return await self._request(Opcode.GET_VIDEO, {
+            "videoId": video_id,
+            "token": token,
+            "chatId": chat_id,
+            "messageId": message_id,
+        })
+
     # ── Events ──────────────────────────────────────────────────
 
     def on_message(self, callback: Callable[[dict], Any]):
@@ -350,6 +743,10 @@ class MaxClient:
     def on_presence(self, callback: Callable[[dict], Any]):
         """Register handler for presence updates (opcode 132)."""
         self._handlers.setdefault(Opcode.PUSH_PRESENCE, []).append(callback)
+
+    def on_call(self, callback: Callable[[dict], Any]):
+        """Register handler for incoming calls (opcode 137)."""
+        self._handlers.setdefault(Opcode.PUSH_INCOMING_CALL, []).append(callback)
 
     def on(self, opcode: int, callback: Callable[[dict], Any]):
         """Register handler for any server push opcode."""
@@ -453,3 +850,25 @@ class MaxAPIError(Exception):
         self.message = payload.get("message", "")
         self.localized = payload.get("localizedMessage", "")
         super().__init__(f"[{self.error}] {self.localized or self.message}")
+
+
+def _guess_mime(path: Path) -> str:
+    """Guess MIME type from file extension."""
+    ext = path.suffix.lower()
+    mime_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".avi": "video/x-msvideo",
+        ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/opus",
+        ".wav": "audio/wav",
+        ".pdf": "application/pdf",
+        ".zip": "application/zip",
+    }
+    return mime_map.get(ext, "application/octet-stream")
