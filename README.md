@@ -12,7 +12,7 @@ cd max-fuck
 pip install -r requirements.txt
 ```
 
-Зависимости: `websockets`, `qrcode`, `aiohttp`
+Зависимости: `websockets`, `qrcode`, `aiohttp`, `aiortc`
 
 ## Быстрый старт
 
@@ -207,9 +207,20 @@ for attach in message.get("attaches", []):
 | `get_call_history(count=100)` | История звонков |
 
 ```python
-# Начать видеозвонок
+# Аудиозвонок с WebRTC (полноценный, с микрофоном)
+call = await client.call([remote_user_id], is_video=False)
+await call.wait(timeout=60)  # ждать до 60 секунд
+await call.hangup()
+
+# Видеозвонок
+call = await client.call([remote_user_id], is_video=True)
+
+# Записать входящее аудио в файл
+call = await client.call([remote_user_id], audio_output="recording.wav")
+
+# Низкоуровневый initiate (только сигнализация, без WebRTC)
 result = await client.initiate_call([user_id], is_video=True)
-# result содержит conversationId и WebRTC endpoint
+# result содержит conversationId, WebRTC endpoint, TURN/STUN
 
 # История звонков
 calls = await client.get_call_history()
@@ -413,7 +424,7 @@ max-fuck/
 - Работает от имени обычного аккаунта, не бота
 - QR нужно сканировать один раз (потом токен переиспользуется)
 - MAX может изменить протокол в любой момент — это реверс-инжиниринг
-- Звонки: можно инициировать, но WebRTC-обработка (аудио/видео стрим) не реализована
+- Звонки: полноценная реализация через aiortc (WebRTC). Может потребовать настройки микрофона на вашей ОС
 - Голосовые/кружки: отправка реализована, но точный формат может потребовать тестирования
 
 ## Лицензия

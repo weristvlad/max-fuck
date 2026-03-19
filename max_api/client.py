@@ -93,7 +93,15 @@ class MaxClient:
     async def login(self, token: str) -> dict:
         """Login with an existing session token."""
         self._token = token
-        return await self._request(Opcode.LOGIN, {"token": token})
+        return await self._request(Opcode.LOGIN, {
+            "token": token,
+            "chatsCount": 40,
+            "interactive": True,
+            "chatsSync": 0,
+            "contactsSync": 0,
+            "presenceSync": -1,
+            "draftsSync": 0,
+        })
 
     async def auto_login(
         self, password: str | None = None, show_qr: bool = True
@@ -395,10 +403,12 @@ class MaxClient:
             dict with fileId and token.
         """
         import aiohttp
+        from urllib.parse import quote
 
         file_path = Path(file_path)
         info = await self._get_file_upload_url()
         file_data = file_path.read_bytes()
+        encoded_name = quote(file_path.name)
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -407,14 +417,17 @@ class MaxClient:
                 headers={
                     "Origin": "https://web.max.ru",
                     "Content-Type": _guess_mime(file_path),
-                    "Content-Disposition": f"attachment; filename={file_path.name}",
+                    "Content-Disposition": f"attachment; filename={encoded_name}",
                     "Content-Range": f"0-{len(file_data) - 1}/{len(file_data)}",
                 },
             ) as resp:
                 resp.raise_for_status()
 
-        # Confirm upload
-        await self._request(Opcode.CHECK_FILE_UPLOAD, {"fileId": info["fileId"]})
+        # Confirm upload (fire-and-forget, no response expected)
+        try:
+            await self._request(Opcode.CHECK_FILE_UPLOAD, {"fileId": info["fileId"]})
+        except Exception:
+            pass  # Some servers don't support this opcode
         return {"fileId": info["fileId"], "token": info["token"]}
 
     async def send_photo(
@@ -674,7 +687,7 @@ class MaxClient:
     async def initiate_call(
         self, user_ids: list[int], is_video: bool = False
     ) -> dict:
-        """Initiate an outgoing call.
+        """Initiate an outgoing call (low-level, returns raw params).
 
         Args:
             user_ids: List of user IDs to call.
@@ -697,6 +710,51 @@ class MaxClient:
             }),
             "isVideo": is_video,
         })
+
+    async def call(
+        self,
+        user_ids: list[int],
+        is_video: bool = False,
+        audio_output: str | None = None,
+    ):
+        """Make an audio/video call with full WebRTC support.
+
+        Initiates the call via MAX WS, then connects to the
+        videowebrtc signaling server and establishes a peer connection.
+
+        Args:
+            user_ids: List of user IDs to call.
+            is_video: True for video call, False for audio only.
+            audio_output: File path to record incoming audio (optional).
+
+        Returns:
+            MaxCall instance. Use call.wait() to block, call.hangup() to end.
+        """
+        from .calls import MaxCall
+
+        # Step 1: Initiate call via MAX WebSocket (opcode 78)
+        result = await self.initiate_call(user_ids, is_video=is_video)
+        caller_params = json.loads(result["internalCallerParams"])
+
+        # Step 2: Extract signaling URL and TURN/STUN from response
+        signaling_url = caller_params["endpoint"]
+        turn_config = caller_params.get("turn", {})
+        stun_config = caller_params.get("stun", {})
+        my_internal_id = caller_params.get("id.internal", 0)
+
+        print(f"[Call] Conversation: {result['conversationId']}")
+        print(f"[Call] Signaling: {signaling_url[:80]}...")
+
+        # Step 3: Create and start the WebRTC call
+        call = MaxCall(
+            signaling_url=signaling_url,
+            turn_config=turn_config,
+            stun_config=stun_config,
+            my_user_id=my_internal_id,
+            audio_output=audio_output,
+        )
+        await call.start(audio_only=not is_video)
+        return call
 
     # ── Chat state ─────────────────────────────────────────────
 
