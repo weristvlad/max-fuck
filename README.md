@@ -7,7 +7,7 @@
 ## Установка
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/weristvlad/max-fuck
 cd max-fuck
 pip install -r requirements.txt
 ```
