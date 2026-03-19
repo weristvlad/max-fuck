@@ -12,19 +12,31 @@ DEFAULT_TOKEN_FILE = Path.home() / ".max_token.json"
 def save_token(
     token: str,
     path: Path = DEFAULT_TOKEN_FILE,
+    login_token: str | None = None,
     lifetime_ts: int | None = None,
     refresh_ts: int | None = None,
 ):
     """Save auth token to disk.
 
     Args:
-        token: The auth token string.
+        token: The current session token (from refresh or login).
         path: File path.
-        lifetime_ts: Token expiry timestamp in ms (from server).
-        refresh_ts: Recommended refresh timestamp in ms (from server).
+        login_token: The original long-lived LOGIN token (survives months).
+        lifetime_ts: Session token expiry timestamp in ms.
+        refresh_ts: Recommended refresh timestamp in ms.
     """
+    # Preserve existing login_token if not provided
+    existing_login = None
+    if path.exists() and login_token is None:
+        try:
+            existing = json.loads(path.read_text())
+            existing_login = existing.get("login_token")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
     data = {
         "token": token,
+        "login_token": login_token or existing_login or token,
         "saved_at": int(time.time()),
     }
     if lifetime_ts:
@@ -32,24 +44,33 @@ def save_token(
     if refresh_ts:
         data["refresh_ts"] = refresh_ts
     path.write_text(json.dumps(data))
-    os.chmod(path, 0o600)  # only owner can read
+    os.chmod(path, 0o600)
 
 
 def load_token(path: Path = DEFAULT_TOKEN_FILE) -> str | None:
-    """Load saved token if it hasn't expired, or None."""
+    """Load the best available token.
+
+    Tries session token first, falls back to long-lived login token.
+    """
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text())
+
+        # Try session token if not expired
         token = data.get("token")
-        if not token:
-            return None
-        # Check if token has expired
         lifetime_ts = data.get("lifetime_ts")
-        if lifetime_ts:
+        if token and lifetime_ts:
             now_ms = int(time.time() * 1000)
-            if now_ms >= lifetime_ts:
-                return None  # expired
+            if now_ms < lifetime_ts:
+                return token  # session token still valid
+
+        # Fall back to long-lived login token (survives months)
+        login_token = data.get("login_token")
+        if login_token:
+            return login_token
+
+        # Last resort: try session token even if expired
         return token
     except (json.JSONDecodeError, KeyError):
         return None

@@ -164,7 +164,7 @@ class MaxClient:
             return getpass.getpass("Enter password: ")
 
         token = await self._login_qr(password_callback, show_qr=show_qr)
-        save_token(token)
+        save_token(token, login_token=token)
         print("Token saved. Next login will be automatic.")
         self._start_token_refresh_loop()
         return await self._request(Opcode.PING, {"interactive": True})
