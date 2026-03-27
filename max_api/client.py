@@ -243,53 +243,110 @@ class MaxClient:
         phone: str,
         password_callback: Callable[[str, str], str],
     ) -> str:
-        """Interactive SMS login flow. Returns session token.
+        """SMS login via binary TCP to api.oneme.ru:443.
+
+        SMS auth is NOT available via WebSocket (phone-auth-enabled=false for WEB).
+        Requires binary TCP protocol with deviceType=ANDROID.
+        See docs/max-sms-auth-flow.md for protocol details.
 
         Args:
             phone: Phone number (e.g. "+79001234567").
             password_callback: Called with (email_hint, password_hint) if 2FA needed.
         """
-        # Step 1: Create auth track
+        import ssl
+        import struct
+
+        host = "api.oneme.ru"
+        port = 443
+
+        ssl_ctx = ssl.create_default_context()
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
+
+        tcp_seq = 0
+
+        async def tcp_send(opcode: int, payload: dict) -> dict:
+            nonlocal tcp_seq
+            data = json.dumps({
+                "ver": PROTOCOL_VERSION,
+                "cmd": Cmd.REQUEST,
+                "seq": tcp_seq,
+                "opcode": opcode,
+                "payload": payload,
+            }).encode()
+            # Binary frame: 4-byte big-endian length + data
+            writer.write(struct.pack(">I", len(data)) + data)
+            await writer.drain()
+
+            # Read response
+            header = await reader.readexactly(4)
+            resp_len = struct.unpack(">I", header)[0]
+            resp_data = await reader.readexactly(resp_len)
+            resp = json.loads(resp_data)
+            tcp_seq += 1
+
+            payload = resp.get("payload", {})
+            if resp.get("cmd") == Cmd.ERROR:
+                raise MaxAPIError(payload)
+            return payload
+
         try:
-            await self._request(Opcode.AUTH_CREATE_TRACK, {"type": 0})
-        except Exception:
-            pass  # Some server versions may not require track creation
-
-        # Step 2: Request SMS code
-        auth_req = await self._request(Opcode.AUTH_REQUEST, {"phone": phone})
-        verify_token = auth_req["verifyToken"]
-        code_length = auth_req.get("codeLength", 6)
-        print(f"SMS code sent to {phone} ({code_length} digits)")
-
-        # Step 3: Get code from user
-        code = input(f"Enter {code_length}-digit SMS code: ").strip()
-
-        # Step 4: Verify SMS code
-        result = await self._request(Opcode.AUTH, {
-            "token": verify_token,
-            "verifyCode": code,
-            "authTokenType": "CHECK_CODE",
-        })
-
-        # Step 5: Handle 2FA if needed
-        if "passwordChallenge" in result:
-            challenge = result["passwordChallenge"]
-            email = challenge.get("email", "")
-            hint = challenge.get("hint", "")
-            pw = password_callback(email, hint)
-
-            result = await self._request(Opcode.PASSWORD_AUTH, {
-                "trackId": result.get("trackId", ""),
-                "password": pw,
+            # Step 1: INIT with ANDROID deviceType (required for SMS)
+            await tcp_send(Opcode.INIT, {
+                "userAgent": {
+                    "deviceType": "ANDROID",
+                    "locale": "ru",
+                    "appVersion": APP_VERSION,
+                },
+                "deviceId": self._device_id,
             })
 
-        # Step 6: Extract token and login
-        token = result["tokenAttrs"]["LOGIN"]["token"]
+            # Step 2: Request SMS code
+            auth_req = await tcp_send(Opcode.AUTH_REQUEST, {
+                "phone": phone,
+                "type": "START_AUTH",
+            })
+            verify_token = auth_req["verifyToken"]
+            code_length = auth_req.get("codeLength", 6)
+            print(f"SMS code sent to {phone} ({code_length} digits)")
+
+            # Step 3: Get code from user
+            code = input(f"Enter {code_length}-digit SMS code: ").strip()
+
+            # Step 4: Verify SMS code
+            result = await tcp_send(Opcode.AUTH, {
+                "token": verify_token,
+                "verifyCode": code,
+                "authTokenType": "CHECK_CODE",
+            })
+
+            # Step 5: Handle 2FA if needed
+            if "passwordChallenge" in result:
+                challenge = result["passwordChallenge"]
+                email = challenge.get("email", "")
+                hint = challenge.get("hint", "")
+                pw = password_callback(email, hint)
+
+                result = await tcp_send(Opcode.PASSWORD_AUTH, {
+                    "trackId": result.get("trackId", ""),
+                    "password": pw,
+                })
+
+            # Step 6: Extract token
+            token = result["tokenAttrs"]["LOGIN"]["token"]
+
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+        # Step 7: Login via WebSocket with the obtained token
         await self.login(token)
         return token
 
     async def login_sms(self, phone: str, password: str | None = None) -> dict:
         """Login via SMS verification code.
+
+        Uses binary TCP protocol to api.oneme.ru:443 (SMS auth is blocked
+        on WebSocket for WEB clients). See docs/max-sms-auth-flow.md.
 
         Args:
             phone: Phone number (e.g. "+79001234567").

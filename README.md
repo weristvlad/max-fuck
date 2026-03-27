@@ -73,6 +73,11 @@ async with MaxClient() as client:
 
 Флоу: номер → SMS-код → 2FA (если есть) → сессия.
 
+> **Важно:** SMS auth работает через бинарный TCP к `api.oneme.ru:443` (не WebSocket).
+> Сервер блокирует SMS для `deviceType: WEB` — библиотека автоматически использует
+> TCP-соединение с `deviceType: ANDROID` для получения токена, затем логинится через WebSocket.
+> Подробности: [docs/max-sms-auth-flow.md](docs/max-sms-auth-flow.md)
+
 ### Последующие запуски
 
 Автоматические — токен из `~/.max_token.json`, обновляется при каждом подключении.
