@@ -2,7 +2,7 @@
 
 Неофициальный Python API для мессенджера **MAX** (ex VK Teams, ex ICQ).
 
-Работает через реверс-инжиниринг WebSocket-протокола веб-версии (`web.max.ru`). Официального пользовательского API нет, бот-API требует юрлицо — эта библиотека решает проблему.
+Работает через реверс-инжиниринг WebSocket-протокола веб-версии (`web.max.ru`) + дизассемблирование APK v26.11.0. Официального пользовательского API нет, бот-API требует юрлицо — эта библиотека решает проблему.
 
 ## Установка
 
@@ -30,14 +30,14 @@ async def main():
         # Получить чаты
         chats = await client.get_chats()
         for chat in chats[:5]:
-            print(chat["id"], chat.get("lastMessage", {}).get("text", "")[:50])
+            print(chat.get("chatId"), chat.get("title"))
 
 asyncio.run(main())
 ```
 
 ## Авторизация
 
-### Первый запуск
+### QR-код (первый запуск)
 
 `auto_login()` показывает QR-код прямо в терминале:
 
@@ -51,33 +51,46 @@ asyncio.run(main())
 █ ███ █ ▀▄  █  █ ███ █
 ...
 
-QR scanned! Completing auth...
-2FA required. Email: o***@m*****.ru
-Password hint: ваша подсказка
-Enter password: ********
-
 Token saved. Next login will be automatic.
 ```
 
-1. Сканируешь QR в приложении MAX на телефоне (Настройки → Устройства → Сканировать QR)
-2. Если включена 2FA — вводишь пароль (скрыт звёздочками). Если 2FA нет — этот шаг пропускается
+1. Сканируешь QR в приложении MAX (Настройки → Устройства → Сканировать QR)
+2. Если включена 2FA — вводишь пароль
 3. Токен сохраняется в `~/.max_token.json`
+
+### SMS-авторизация (новое)
+
+Вход по номеру телефона без существующей сессии:
+
+```python
+async with MaxClient() as client:
+    # Автоматически: если нет токена → SMS
+    await client.auto_login(phone="+79001234567")
+
+    # Или напрямую:
+    await client.login_sms("+79001234567")
+```
+
+Флоу: номер → SMS-код → 2FA (если есть) → сессия.
 
 ### Последующие запуски
 
-Полностью автоматические — токен подхватывается из файла и обновляется при каждом подключении. QR сканировать не нужно.
+Автоматические — токен из `~/.max_token.json`, обновляется при каждом подключении.
 
-### Ручной логин
+### Все методы авторизации
 
 ```python
-# Логин по токену напрямую (если есть)
-await client.login("your_token_here")
+# Smart login: токен → SMS (если phone задан) → QR
+await client.auto_login(phone="+7...", password="2fa_pass")
 
-# QR с кастомным обработчиком пароля
-token = await client._login_qr(lambda email, hint: "my_password")
+# SMS напрямую
+await client.login_sms("+79001234567", password="2fa_pass")
 
-# Только ссылка без QR (для кастомных клиентов / своего рендера QR)
+# QR без рендера (только ссылка)
 await client.auto_login(show_qr=False)
+
+# Токен напрямую
+await client.login("your_token_here")
 
 # Сброс сохранённого токена
 from max_api import clear_token
@@ -86,9 +99,7 @@ clear_token()
 
 ## API Reference
 
-### MaxClient
-
-#### Подключение
+### Подключение
 
 ```python
 # Как контекстный менеджер (рекомендуется)
@@ -104,186 +115,191 @@ await client.auto_login()
 await client.disconnect()
 ```
 
-#### Авторизация
+### Чаты
 
 | Метод | Описание |
 |-------|----------|
-| `auto_login(password=None, show_qr=True)` | Умный логин: сохранённый токен или QR. `password` — чтобы не вводить вручную, `show_qr=False` — только ссылка без QR (для кастомных клиентов) |
-| `login(token)` | Логин по токену напрямую |
-| `refresh_token()` | Обновить токен (вызывается автоматически) |
-| `logout()` | Отключиться и удалить сохранённый токен |
+| `get_chats(chat_ids=None)` | Список чатов. `[0]` = все |
+| `get_chats_updates(marker=0)` | Чаты, обновлённые после `marker` |
+| `create_chat(title, member_ids, chat_type="GROUP")` | Создать чат/канал |
+| `update_chat(chat_id, title=None, about=None)` | Изменить название/описание |
+| `delete_chat(chat_id)` | Удалить чат |
+| `clear_chat(chat_id)` | Очистить историю |
+| `hide_chat(chat_id)` | Скрыть из списка |
+| `join_chat(chat_link)` | Вступить по ссылке |
+| `leave_chat(chat_id)` | Покинуть чат |
+| `check_chat_link(link)` | Проверить ссылку без вступления |
+| `subscribe_chat(chat_id, subscribe=True)` | Подписка на real-time события |
+| `get_chat_members_list(chat_id)` | Список участников (группы/каналы) |
+| `get_chat_members(chat_id)` | Инфо обо всех участниках чата |
+| `update_chat_members(chat_id, add=[], remove=[])` | Добавить/удалить участников |
+| `get_common_chats(user_ids)` | Общие чаты с пользователем |
 
-#### Чаты
-
-| Метод | Описание |
-|-------|----------|
-| `get_chats()` | Список всех чатов |
-| `get_chats_updates(marker)` | Чаты, обновлённые после `marker` (timestamp) |
-| `get_folders()` | Папки чатов |
-| `subscribe_chat(chat_id)` | Подписаться на real-time события чата |
-
-#### Сообщения
-
-| Метод | Описание |
-|-------|----------|
-| `get_messages(chat_id, from_ts=0, forward=30, backward=30)` | Получить сообщения из чата |
-| `get_media_messages(chat_id, message_id, attach_types=["PHOTO","VIDEO"])` | Получить медиа-сообщения вокруг указанного |
-| `send_message(chat_id, text, reply_to=None)` | Отправить текстовое сообщение |
-| `mark_read(chat_id, message_id)` | Пометить сообщение как прочитанное |
-| `send_typing(chat_id)` | Отправить индикатор "печатает..." |
-
-#### Отправка файлов и медиа
+### Папки
 
 | Метод | Описание |
 |-------|----------|
-| `send_photo(chat_id, file_path, text=None, reply_to=None)` | Загрузить и отправить фото. Поддерживает подпись |
-| `send_file(chat_id, file_path, text=None, reply_to=None)` | Загрузить и отправить файл любого типа |
-| `send_voice(chat_id, file_path, duration_ms=None, reply_to=None)` | Отправить голосовое сообщение (OGG/MP3) |
-| `send_video(chat_id, file_path, text=None, reply_to=None)` | Отправить видео |
-| `send_video_message(chat_id, file_path, reply_to=None)` | Отправить кружок (видеосообщение 480x480) |
+| `get_folders()` | Получить все папки |
+| `get_folder(folder_id)` | Получить папку по ID (строка) |
+| `update_folder(folder_id, title=None, chat_ids=None)` | Обновить папку |
+| `reorder_folders(folder_ids)` | Изменить порядок папок |
+
+### Сообщения
+
+| Метод | Описание |
+|-------|----------|
+| `get_messages(chat_id, from_ts=0, forward=30, backward=30)` | Получить сообщения |
+| `get_message(chat_id, message_ids)` | Получить сообщение(я) по ID (int или list[int]) |
+| `get_media_messages(chat_id, message_id, attach_types=["PHOTO","VIDEO"])` | Медиа-сообщения |
+| `send_message(chat_id, text, reply_to=None, elements=None, send_time=None)` | Отправить текст |
+| `edit_message(chat_id, message_id, text, elements=None)` | Редактировать |
+| `delete_message(chat_id, message_id, for_all=True)` | Удалить |
+| `delete_message_range(chat_id, from_id, to_id)` | Удалить диапазон |
+| `forward_messages(chat_id, from_chat_id, message_ids)` | Переслать |
+| `mark_read(chat_id, message_id)` | Пометить прочитанным |
+| `send_typing(chat_id)` | Индикатор "печатает..." |
+| `get_message_link(chat_id, message_id)` | Получить ссылку на сообщение |
+| `get_link_info(url)` | Превью ссылки (Open Graph) |
+| `search_messages(chat_id, query, count=30)` | Поиск по чату |
+| `search_chats(query, count=30)` | Поиск чатов по названию |
+| `pin_message(chat_id)` | Показать закреплённое |
+| `unpin_message(chat_id)` | Скрыть закреплённое |
+
+### Форматирование текста
 
 ```python
-# Фото
-await client.send_photo(chat_id, "photo.png")
-await client.send_photo(chat_id, "photo.png", text="с подписью")
+from max_api import parse_formatted_text
 
-# Файл
+text, elements = parse_formatted_text(
+    "**жирный** *курсив* ~~зачёркнутый~~ ++подчёркнутый++ `код` [ссылка](https://max.ru)"
+)
+await client.send_message(chat_id, text, elements=elements)
+```
+
+Поддержка: `**bold**`, `*italic*`, `***bold italic***`, `~~strike~~`, `++underline++`, `^^highlight^^`, `` `code` ``, `[text](url)`
+
+### Отправка файлов
+
+| Метод | Описание |
+|-------|----------|
+| `send_photo(chat_id, file_path, text=None, reply_to=None)` | Фото |
+| `send_file(chat_id, file_path, text=None, reply_to=None)` | Любой файл |
+| `send_voice(chat_id, file_path, duration_ms=None, reply_to=None)` | Голосовое (OGG/MP3/WAV) |
+| `send_video(chat_id, file_path, text=None, reply_to=None)` | Видео |
+| `send_video_message(chat_id, file_path, reply_to=None)` | Кружок (480x480) |
+
+```python
+await client.send_photo(chat_id, "photo.png", text="подпись")
 await client.send_file(chat_id, "document.pdf")
-
-# Голосовое
 await client.send_voice(chat_id, "voice.ogg", duration_ms=5000)
-
-# Видео
 await client.send_video(chat_id, "video.mp4")
-
-# Кружок (видеосообщение)
 await client.send_video_message(chat_id, "circle.mp4")
 ```
 
-#### Загрузка медиа — как это работает
-
-Отправка файлов идёт в 2 этапа:
-
-1. **Upload** — файл загружается на сервер MAX через HTTP:
-   - Фото → `iu.oneme.ru` (multipart/form-data), получаешь `photoToken`
-   - Файлы/видео/голосовые → `fu.oneme.ru` (raw binary + Content-Range), получаешь `fileId`
-2. **Send** — через WebSocket (opcode 64) отправляется сообщение с аттачем
-
-Всё это автоматизировано в методах `send_photo()`, `send_file()`, `send_voice()`, `send_video()`, `send_video_message()`.
-
-> **Кружки (видеосообщения):** отправляются как обычное видео с `videoType: 1`. Видео должно быть квадратным 480x480. Метод `send_video_message()` делает это автоматически.
->
-> **Голосовые:** загружаются как файл, но отправляются с типом `AUDIO`. Рекомендуемый формат — OGG Opus или MP3.
-
-#### Пользователи и поиск
+### Контакты и пользователи
 
 | Метод | Описание |
 |-------|----------|
-| `get_user(user_id)` | Получить инфу о пользователе по ID (имя, телефон, аватар, ник) |
-| `get_contacts(contact_ids)` | Получить инфу о нескольких пользователях разом |
-| `get_chat_members(chat_id)` | Получить инфу обо всех участниках чата |
-| `find_user(query)` | Поиск пользователей по имени, нику или телефону |
-| `search(query, count=30, search_type="ALL")` | Поиск контактов и чатов (низкоуровневый) |
-| `get_reactions(chat_id, message_ids)` | Реакции на сообщения |
+| `get_user(user_id)` | Инфо о пользователе (имя, телефон, аватар) |
+| `get_contacts(contact_ids)` | Инфо о нескольких пользователях |
+| `find_user(query)` | Поиск в контактах |
+| `contact_search(query, count=30)` | Поиск в своих контактах |
+| `contact_by_phone(phone)` | Найти по номеру телефона |
+| `mutual_contacts(user_id)` | Общие контакты |
+| `get_user_score(user_id)` | Рейтинг/карма |
+| `search(query, count=30, search_type=None)` | Публичный поиск. Типы: `ALL`, `CHANNELS`, `PUBLIC_CHATS` |
 
 ```python
-# Получить инфу о пользователе
 user = await client.get_user(6725252)
-print(user["names"][0]["name"])  # имя
-print(user.get("phone"))         # телефон (если доступен)
-print(user.get("link"))          # ссылка на профиль
+print(user["names"][0]["name"])
 
-# Все участники чата
-members = await client.get_chat_members(13796912)
+members = await client.get_chat_members(chat_id)
 for m in members:
     print(f'{m["id"]}: {m["names"][0]["name"]}')
-
-# Поиск по имени/нику
-results = await client.find_user("Влад")
-for r in results:
-    print(r)
 ```
 
-#### Медиа
+### Реакции
 
 | Метод | Описание |
 |-------|----------|
-| `get_video_url(video_id, token, chat_id, message_id)` | Получить прямую ссылку на видео для скачивания/воспроизведения |
+| `react(chat_id, message_id, emoji)` | Поставить реакцию |
+| `remove_reaction(chat_id, message_id)` | Убрать реакцию |
+| `get_reactions(chat_id, message_ids)` | Сводка реакций |
+| `get_detailed_reactions(chat_id, message_id, emoji=None)` | Кто поставил реакцию |
+| `set_chat_reaction_settings(chat_id, emojis)` | Настроить доступные реакции |
+| `get_chat_reaction_settings(chat_ids)` | Получить настройки реакций |
 
 ```python
-# Получить URL видео из сообщения
-for attach in message.get("attaches", []):
-    if attach["_type"] == "VIDEO":
-        urls = await client.get_video_url(
-            attach["videoId"], attach["token"], chat_id, message["id"]
-        )
-        print(urls)  # {"MP4_480": "https://...", "MP4_720": "https://..."}
+await client.react(chat_id, msg_id, "👍")
+reactions = await client.get_reactions(chat_id, [msg_id])
+await client.remove_reaction(chat_id, msg_id)
 ```
 
-#### Звонки
+### Черновики
 
 | Метод | Описание |
 |-------|----------|
-| `initiate_call(user_ids, is_video=False)` | Начать звонок (аудио/видео). Возвращает WebRTC параметры |
+| `save_draft(chat_id, text)` | Сохранить черновик |
+| `discard_draft(chat_id)` | Удалить черновик |
+
+### Звонки
+
+| Метод | Описание |
+|-------|----------|
+| `call(user_ids, is_video=False, audio_output=None)` | Полноценный WebRTC-звонок |
+| `initiate_call(user_ids, is_video=False)` | Низкоуровневый: только сигнализация |
 | `get_call_history(count=100)` | История звонков |
 
 ```python
-# Аудиозвонок с WebRTC (полноценный, с микрофоном)
-call = await client.call([remote_user_id], is_video=False)
-await call.wait(timeout=60)  # ждать до 60 секунд
+# Аудиозвонок
+call = await client.call([user_id])
+await call.wait(timeout=60)
 await call.hangup()
 
-# Видеозвонок
-call = await client.call([remote_user_id], is_video=True)
-
-# Записать входящее аудио в файл
-call = await client.call([remote_user_id], audio_output="recording.wav")
-
-# Низкоуровневый initiate (только сигнализация, без WebRTC)
-result = await client.initiate_call([user_id], is_video=True)
-# result содержит conversationId, WebRTC endpoint, TURN/STUN
-
-# История звонков
-calls = await client.get_call_history()
-for call in calls.get("history", []):
-    attach = call["message"]["attaches"][0]
-    print(f'{attach["callType"]} — {attach["hangupType"]} — {attach["duration"]}ms')
+# С записью входящего аудио
+call = await client.call([user_id], audio_output="recording.wav")
 ```
 
-#### Стикеры
+### Стикеры
 
 | Метод | Описание |
 |-------|----------|
-| `get_sticker_sets(section_id, offset, count)` | Получить список ID наборов стикеров |
-| `sync_stickers(sticker_type, sync)` | Синхронизировать стикеры/анимодзи |
+| `get_sticker_sets(section_id, offset, count)` | Наборы стикеров |
+| `sync_stickers(sticker_type, sync)` | Синхронизация |
 
-#### События (real-time)
+### Сессии
+
+| Метод | Описание |
+|-------|----------|
+| `get_sessions()` | Список активных сессий |
+| `close_session(session_id)` | Закрыть сессию |
+
+### Прочее
+
+| Метод | Описание |
+|-------|----------|
+| `complain_reasons()` | Список причин для жалоб |
+| `logout()` | Выход + удаление токена |
+
+### События (real-time)
 
 ```python
-# Обработчик входящих сообщений
-def on_msg(payload):
-    msg = payload["message"]
-    print(f'{msg["sender"]}: {msg["text"]}')
-
-client.on_message(on_msg)   # новые сообщения
-client.on_presence(handler)  # статус онлайн/оффлайн
-client.on_call(handler)      # входящие звонки
-client.on(opcode, handler)   # любой серверный push по опкоду
+client.on_message(handler)          # входящие сообщения
+client.on_typing(handler)           # индикатор набора
+client.on_presence(handler)         # онлайн/оффлайн
+client.on_call(handler)             # входящие звонки
+client.on_chat_update(handler)      # изменения чатов
+client.on_reactions(handler)        # изменения реакций
+client.on_delayed_message(handler)  # отложенные сообщения
+client.on_mark(handler)             # прочитано в другой сессии
+client.on_contact(handler)          # изменения контактов
+client.on_location(handler)         # геолокация
+client.on_folder_update(handler)    # изменения папок
+client.on_delete_range(handler)     # пакетное удаление
+client.on(opcode, handler)          # любой push по опкоду
 ```
 
-Хендлеры могут быть синхронными или `async`.
-
-##### Типы аттачей во входящих сообщениях
-
-| `_type` | Описание | Ключевые поля |
-|---------|----------|---------------|
-| `PHOTO` | Фото | `photoId`, `width`, `height`, `baseUrl` |
-| `FILE` | Файл | `fileId`, `name`, `size`, `token` |
-| `VIDEO` | Видео / кружок | `videoId`, `videoType` (0=видео, 1=кружок), `width`, `height`, `duration`, `token` |
-| `AUDIO` | Голосовое | `audioId`, `duration`, `url`, `wave` |
-| `CALL` | Звонок | `callType`, `hangupType`, `duration`, `conversationId` |
-| `SHARE` | Ссылка | `url`, `host` |
-| `CONTROL` | Системное | — |
+Хендлеры могут быть `sync` или `async`.
 
 ## Примеры
 
@@ -306,52 +322,39 @@ async def main():
             await client.send_message(chat_id, f"Echo: {text}")
 
     client.on_message(on_message)
-    await asyncio.Future()  # работает вечно
+    await asyncio.Future()
 
 asyncio.run(main())
 ```
 
-### Прочитать последние сообщения
+### SMS-логин + отправка
 
 ```python
-async with MaxClient() as client:
-    await client.auto_login()
-    messages = await client.get_messages(188165680, backward=10)
-    for msg in messages:
-        print(f'[{msg["sender"]}] {msg["text"]}')
+import asyncio
+from max_api import MaxClient
+
+async def main():
+    async with MaxClient() as client:
+        await client.auto_login(phone="+79001234567")
+        await client.send_message(chat_id, "залогинился по SMS!")
+
+asyncio.run(main())
 ```
 
-### Отправить фото с подписью
-
-```python
-async with MaxClient() as client:
-    await client.auto_login()
-    await client.send_photo(chat_id, "screenshot.png", text="смотри что нашёл")
-```
-
-### Мониторинг всех входящих с медиа
+### Мониторинг с реакциями
 
 ```python
 async with MaxClient() as client:
     await client.auto_login()
 
-    def handler(payload):
+    async def handler(payload):
         chat = payload["chatId"]
         msg = payload["message"]
         text = msg.get("text", "")
-        attaches = msg.get("attaches", [])
-
         if text:
             print(f"[{chat}] {msg['sender']}: {text}")
-        for a in attaches:
-            t = a["_type"]
-            if t == "PHOTO":
-                print(f"[{chat}] фото: {a['baseUrl']}")
-            elif t == "VIDEO":
-                kind = "кружок" if a.get("videoType") == 1 else "видео"
-                print(f"[{chat}] {kind}: {a['duration']}ms")
-            elif t == "AUDIO":
-                print(f"[{chat}] голосовое: {a['duration']}ms")
+            # Автореакция на все сообщения
+            await client.react(chat, msg["id"], "👍")
 
     client.on_message(handler)
     await asyncio.Future()
@@ -359,70 +362,147 @@ async with MaxClient() as client:
 
 ## Протокол
 
-Всё общение идёт через WebSocket на `wss://ws-api.oneme.ru/websocket`.
+WebSocket: `wss://ws-api.oneme.ru/websocket`, протокол v11, APP_VERSION 26.11.0.
 
-Формат сообщений:
 ```json
 {"ver": 11, "cmd": 0, "seq": 1, "opcode": 64, "payload": {...}}
 ```
 
-- `ver` — версия протокола (11)
-- `cmd` — 0: запрос, 1: ответ, 3: ошибка
+- `cmd` — 0: запрос, 1: ответ, 2: push, 3: ошибка
 - `seq` — порядковый номер для матчинга запрос/ответ
-- `opcode` — код операции
-- `payload` — данные
 
-### Карта опкодов
+### Полная карта опкодов
+
+<details>
+<summary>Развернуть (80+ опкодов)</summary>
 
 | Opcode | Константа | Описание |
 |--------|-----------|----------|
 | 1 | `PING` | Keep-alive |
-| 5 | `ANALYTICS` | Аналитика/телеметрия |
+| 2 | `DEBUG` | Отладка |
+| 3 | `RECONNECT` | Переподключение |
+| 5 | `ANALYTICS` | Аналитика |
 | 6 | `INIT` | Инициализация соединения |
+| 16 | `PROFILE` | Профиль |
+| 17 | `AUTH_REQUEST` | SMS-авторизация: отправка номера |
+| 18 | `AUTH` | SMS-авторизация: подтверждение кодом |
 | 19 | `LOGIN` | Логин по токену |
+| 20 | `LOGOUT` | Выход |
+| 21 | `SYNC` | Синхронизация |
+| 22 | `CONFIG` | Конфигурация |
+| 23 | `AUTH_CONFIRM` | Подтверждение авторизации |
+| 25 | `PRESET_AVATARS` | Пресетные аватарки |
 | 26 | `GET_STICKER_SETS` | Наборы стикеров |
 | 27 | `STICKER_SYNC` | Синхронизация стикеров |
-| 28 | `ANIMOJI` | Анимодзи/реакции |
+| 28 | `ANIMOJI` | Анимодзи |
+| 29 | `ASSETS_ADD` | Добавить ассет |
 | 32 | `GET_CONTACTS` | Информация о контактах |
+| 33 | `CONTACT_ADD` | Добавить контакт |
+| 34 | `CONTACT_UPDATE` | Обновить контакт |
+| 35 | `CONTACT_PRESENCE` | Присутствие |
+| 36 | `CONTACT_LIST` | Список контактов |
+| 37 | `CONTACT_SEARCH` | Поиск в контактах |
+| 38 | `CONTACT_MUTUAL` | Общие контакты |
+| 39 | `CONTACT_PHOTOS` | Фото контакта |
+| 40 | `CONTACT_SORT` | Сортировка |
+| 41 | `CONTACT_CREATE` | Создать контакт |
+| 42 | `CONTACT_VERIFY` | Верификация |
+| 43 | `REMOVE_CONTACT_PHOTO` | Удалить фото |
+| 44 | `OWN_CONTACT_SEARCH` | Поиск собственного контакта |
+| 45 | `CONTACT_INFO_EXTERNAL` | Внешняя инфо |
+| 46 | `CONTACT_INFO_BY_PHONE` | Поиск по телефону |
 | 48 | `GET_CHATS` | Список чатов |
-| 49 | `GET_MESSAGES` | Сообщения из чата |
-| 50 | `MARK_READ` | Пометить прочитанным |
-| 51 | `GET_MEDIA_MESSAGES` | Медиа-сообщения по типу |
-| 53 | `GET_CHATS_UPDATES` | Обновления чатов |
+| 49 | `GET_MESSAGES` | Сообщения |
+| 50 | `MARK_READ` | Прочитано |
+| 51 | `GET_MEDIA_MESSAGES` | Медиа |
+| 52 | `DELETE_CHAT` | Удалить чат |
+| 53 | `GET_CHATS_UPDATES` | Обновления |
+| 54 | `CLEAR_CHAT` | Очистить |
+| 55 | `UPDATE_CHAT` | Обновить |
+| 56 | `CHECK_CHAT_LINK` | Проверить ссылку |
+| 57 | `JOIN_CHAT` | Вступить |
+| 58 | `LEAVE_CHAT` | Покинуть |
+| 59 | `GET_CHAT_MEMBERS` | Участники |
 | 60 | `SEARCH` | Поиск |
-| 64 | `SEND_MESSAGE` | Отправка сообщения |
-| 65 | `TYPING` | Индикатор набора |
-| 75 | `SUBSCRIBE_CHAT` | Подписка на события чата |
-| 78 | `INITIATE_CALL` | Начало исходящего звонка |
+| 61 | `CLOSE_CHAT` | Закрыть |
+| 63 | `CREATE_CHAT` | Создать |
+| 64 | `SEND_MESSAGE` | Отправить |
+| 65 | `TYPING` | Печатает |
+| 66 | `DELETE_MESSAGE` | Удалить сообщение |
+| 67 | `EDIT_MESSAGE` | Редактировать |
+| 68 | `SEARCH_CHATS` | Поиск чатов |
+| 69 | `FORWARD_MESSAGE` | Переслать |
+| 70 | `MSG_SHARE_PREVIEW` | Превью ссылки |
+| 71 | `GET_MESSAGE` | Получить сообщение |
+| 72 | `SEARCH_TOUCH` | Поиск (touch) |
+| 73 | `SEARCH_MESSAGES` | Поиск в чате |
+| 74 | `GET_MESSAGE_STATS` | Статистика |
+| 75 | `SUBSCRIBE_CHAT` | Подписка |
+| 76 | `VIDEO_CHAT_START` | Видеочат |
+| 77 | `UPDATE_CHAT_MEMBERS` | Обновить участников |
+| 78 | `INITIATE_CALL` | Начать звонок |
 | 79 | `GET_CALL_HISTORY` | История звонков |
-| 80 | `GET_IMAGE_UPLOAD_URL` | Получить URL для загрузки фото |
-| 83 | `GET_VIDEO` | Получить URL видео |
-| 87 | `GET_FILE_UPLOAD_URL` | Получить URL для загрузки файла |
+| 80 | `GET_IMAGE_UPLOAD_URL` | URL загрузки фото |
+| 81 | `GET_STICKER_UPLOAD_URL` | URL загрузки стикера |
+| 82 | `GET_VIDEO_UPLOAD_URL` | URL загрузки видео |
+| 83 | `GET_VIDEO` | URL видео |
+| 84 | `VIDEO_CHAT_CREATE_JOIN_LINK` | Ссылка на звонок |
+| 86 | `CHAT_PIN_SET_VISIBILITY` | Закреп |
+| 87 | `GET_FILE_UPLOAD_URL` | URL загрузки файла |
+| 88 | `GET_FILE_DOWNLOAD_URL` | URL скачивания файла |
+| 89 | `GET_LINK_INFO` | Превью ссылки |
+| 90 | `GET_MESSAGE_LINK` | Ссылка на сообщение |
+| 92 | `MSG_DELETE_RANGE` | Удалить диапазон |
+| 96 | `GET_SESSIONS` | Сессии |
+| 97 | `CLOSE_SESSION` | Закрыть сессию |
+| 101 | `AUTH_LOGIN_RESTORE_PASSWORD` | Восстановление пароля |
+| 103 | `GET_INBOUND_CALLS` | Входящие звонки |
+| 112 | `AUTH_CREATE_TRACK` | Трек авторизации |
+| 113 | `AUTH_CHECK_PASSWORD` | Проверка пароля |
 | 115 | `PASSWORD_AUTH` | 2FA пароль |
-| 128 | `PUSH_NEW_MESSAGE` | Пуш: новое сообщение |
-| 129 | `PUSH_CONTENT_ACK` | Пуш: подтверждение доставки медиа |
-| 130 | `SET_CHAT_READ_STATE` | Пометить чат прочитанным/непрочитанным |
-| 132 | `PUSH_PRESENCE` | Пуш: статус пользователя |
-| 136 | `CHECK_FILE_UPLOAD` | Подтверждение загрузки файла |
-| 137 | `PUSH_INCOMING_CALL` | Пуш: входящий звонок |
+| 127 | `GET_LAST_MENTIONS` | Последние упоминания |
 | 158 | `TOKEN_REFRESH` | Обновление токена |
-| 177 | `GET_USER_STORIES` | Статусы/сторис пользователей |
-| 180 | `GET_REACTIONS` | Реакции на сообщения |
-| 272 | `GET_FOLDERS` | Папки чатов |
-| 288 | `QR_AUTH_INIT` | Начало QR-авторизации |
-| 289 | `QR_AUTH_POLL` | Поллинг статуса QR |
-| 291 | `QR_AUTH_COMPLETE` | Завершение QR-авторизации |
-| 292 | `PUSH_BANNERS` | Баннеры/промо |
+| 162 | `COMPLAIN_REASONS_GET` | Причины жалоб |
+| 176 | `DRAFT_SAVE` | Сохранить черновик |
+| 177 | `DRAFT_DISCARD` | Удалить черновик |
+| 178 | `REACT` | Реакция |
+| 179 | `CANCEL_REACTION` | Отмена реакции |
+| 180 | `GET_REACTIONS` | Получить реакции |
+| 181 | `GET_DETAILED_REACTIONS` | Детальные реакции |
+| 193 | `STICKER_CREATE` | Создать стикер |
+| 196 | `CHAT_HIDE` | Скрыть чат |
+| 198 | `GET_COMMON_CHATS` | Общие чаты |
+| 201 | `GET_USER_SCORE` | Рейтинг |
+| 257 | `CHAT_REACTIONS_SETTINGS_SET` | Настройки реакций |
+| 258 | `REACTIONS_SETTINGS_GET_BY_CHAT_ID` | Получить настройки |
+| 259 | `ASSETS_REMOVE` | Удалить ассет |
+| 272 | `GET_FOLDERS` | Папки |
+| 273 | `FOLDERS_GET_BY_ID` | Папка по ID |
+| 274 | `FOLDERS_UPDATE` | Обновить папку |
+| 275 | `FOLDERS_REORDER` | Порядок папок |
+| 288 | `QR_AUTH_INIT` | QR-авторизация |
+| 289 | `QR_AUTH_POLL` | Поллинг QR |
+| 291 | `QR_AUTH_COMPLETE` | Завершение QR |
 
-### Загрузка файлов — эндпоинты
+**Push-уведомления (от сервера):**
 
-| Тип | WS opcode | HTTP endpoint | Формат загрузки |
-|-----|-----------|---------------|-----------------|
-| Фото | 80 | `iu.oneme.ru/uploadImage` | multipart/form-data, field `"file"` |
-| Файлы | 87 | `fu.oneme.ru/api/upload.do` | raw binary + Content-Range |
-| Видео | 87* | `vu.okcdn.ru/upload.do` | raw binary video/mp4 + Content-Range |
+| Opcode | Константа | Описание |
+|--------|-----------|----------|
+| 128 | `PUSH_NEW_MESSAGE` | Новое сообщение |
+| 129 | `PUSH_TYPING` | Печатает |
+| 130 | `PUSH_MARK` | Прочитано |
+| 131 | `PUSH_CONTACT` | Контакт |
+| 132 | `PUSH_PRESENCE` | Присутствие |
+| 134 | `PUSH_CONFIG` | Конфиг |
+| 135 | `PUSH_CHAT` | Чат |
+| 137 | `PUSH_INCOMING_CALL` | Входящий звонок |
+| 140 | `PUSH_MSG_DELETE_RANGE` | Пакетное удаление |
+| 147 | `PUSH_LOCATION` | Геолокация |
+| 154 | `PUSH_MSG_DELAYED` | Отложенное |
+| 155 | `PUSH_REACTIONS_CHANGED` | Реакции |
+| 277 | `PUSH_FOLDERS` | Папки |
 
-*Видео-загрузка использует отдельный CDN (`vu.okcdn.ru`), URL выдаётся сервером.
+</details>
 
 ## Структура проекта
 
@@ -431,27 +511,27 @@ max-fuck/
 ├── max_api/
 │   ├── __init__.py     # Экспорты
 │   ├── client.py       # MaxClient — основной клиент
+│   ├── calls.py        # MaxCall — WebRTC звонки
 │   ├── auth.py         # Токены, QR-код в терминале
-│   └── opcodes.py      # Все опкоды протокола
-├── examples/
-│   ├── basic.py        # Логин + чаты + сообщения
-│   └── echo_bot.py     # Эхо-бот
-├── test_send.py        # Тест отправки
+│   └── opcodes.py      # Все опкоды протокола (80+)
+├── TEST/               # Тесты
+│   ├── test_ultimate.py    # Полный тест всех методов
+│   ├── test_all_sends.py   # Тест отправки всех типов
+│   └── ...
+├── APK/                # Декомпилированный APK + заметки
+│   ├── fucking-max.md      # Полный отчёт по APK
+│   └── max-decompiled/     # Исходники jadx
 └── requirements.txt
 ```
 
 ## Ограничения
 
 - Работает от имени обычного аккаунта, не бота
-- QR нужно сканировать один раз (потом токен переиспользуется)
-- MAX может изменить протокол в любой момент — это реверс-инжиниринг
-- Звонки: полноценная реализация через aiortc (WebRTC). Может потребовать настройки микрофона на вашей ОС
-- Голосовые/кружки: отправка реализована, но точный формат может потребовать тестирования
+- Сервер может обновить протокол в любой момент (validation error + WS disconnect)
+- Некоторые opcodes (`get_folder`, `get_message_stats`, `get_last_mentions`, `contact_add`) не работают на текущей версии сервера
+- Звонки требуют `aiortc` (WebRTC)
+- Сервер дропает WebSocket при validation error — будьте аккуратны с unknown opcodes
 
 ## Лицензия
 
 MIT. Используй на свой страх и риск.
-
-## Disclaimer
-
-Этот проект полностью навайбкоженный (vibe-coded). Автор не программист, но всё работает. Код написан с помощью AI, протестирован руками. Если что-то сломалось — issue / PR welcome.

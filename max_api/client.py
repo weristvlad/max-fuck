@@ -15,7 +15,7 @@ from .opcodes import Cmd, Opcode
 
 WS_URL = "wss://ws-api.oneme.ru/websocket"
 PROTOCOL_VERSION = 11
-APP_VERSION = "26.3.7"
+APP_VERSION = "26.11.0"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -41,7 +41,7 @@ class MaxClient:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._seq = 0
         self._pending: dict[int, asyncio.Future] = {}
-        self._device_id = str(uuid.uuid4())
+        self._device_id: Optional[str] = None  # Set in auto_login or connect
         self._token: Optional[str] = None
         self._recv_task: Optional[asyncio.Task] = None
         self._refresh_task: Optional[asyncio.Task] = None
@@ -58,6 +58,10 @@ class MaxClient:
     # ── Connection ──────────────────────────────────────────────
 
     async def connect(self):
+        if self._device_id is None:
+            # Try to load persisted device_id before generating a new one
+            _, saved_device_id = load_token()
+            self._device_id = saved_device_id or str(uuid.uuid4())
         self._ws = await websockets.connect(
             WS_URL,
             additional_headers={
@@ -122,28 +126,31 @@ class MaxClient:
         })
 
     async def auto_login(
-        self, password: str | None = None, show_qr: bool = True
+        self,
+        password: str | None = None,
+        show_qr: bool = True,
+        phone: str | None = None,
     ) -> dict:
-        """Smart login: uses saved token if available, QR code if not.
+        """Smart login: uses saved token if available, then SMS or QR.
 
-        First run:  shows QR in terminal → scan with phone → enter 2FA password
+        First run:  SMS (if phone given) or QR code → 2FA password if needed
         Next runs:  instant login from saved token (auto-refreshes if needed)
 
         Args:
             password: 2FA password. If None, will prompt in terminal.
             show_qr: If True (default), renders QR code in terminal.
-                If False, only prints the login link (useful for custom QR rendering).
+            phone: Phone number for SMS login (e.g. "+79001234567").
+                If provided, uses SMS flow instead of QR when no saved token.
 
         Returns:
             Login response with profile info.
         """
-        # Try saved token first
-        saved = load_token()
+        # Try saved token first (device_id already loaded in connect())
+        saved, _ = load_token()
         if saved:
             try:
                 result = await self.login(saved)
                 print("Logged in with saved token.")
-                # Refresh token immediately + start background refresh
                 try:
                     await self.refresh_token()
                 except Exception:
@@ -151,10 +158,9 @@ class MaxClient:
                 self._start_token_refresh_loop()
                 return result
             except MaxAPIError:
-                print("Saved token expired. Starting QR login...")
+                print("Saved token expired.")
                 clear_token()
 
-        # QR login flow
         def password_callback(email_hint, pw_hint):
             if password:
                 return password
@@ -163,8 +169,14 @@ class MaxClient:
                 print(f"Password hint: {pw_hint}")
             return getpass.getpass("Enter password: ")
 
-        token = await self._login_qr(password_callback, show_qr=show_qr)
-        save_token(token, login_token=token)
+        if phone:
+            print(f"Starting SMS login for {phone}...")
+            token = await self._login_sms(phone, password_callback)
+        else:
+            print("Starting QR login...")
+            token = await self._login_qr(password_callback, show_qr=show_qr)
+
+        save_token(token, login_token=token, device_id=self._device_id)
         print("Token saved. Next login will be automatic.")
         self._start_token_refresh_loop()
         return await self._request(Opcode.PING, {"interactive": True})
@@ -226,6 +238,80 @@ class MaxClient:
         await self.login(token)
         return token
 
+    async def _login_sms(
+        self,
+        phone: str,
+        password_callback: Callable[[str, str], str],
+    ) -> str:
+        """Interactive SMS login flow. Returns session token.
+
+        Args:
+            phone: Phone number (e.g. "+79001234567").
+            password_callback: Called with (email_hint, password_hint) if 2FA needed.
+        """
+        # Step 1: Create auth track
+        try:
+            await self._request(Opcode.AUTH_CREATE_TRACK, {"type": 0})
+        except Exception:
+            pass  # Some server versions may not require track creation
+
+        # Step 2: Request SMS code
+        auth_req = await self._request(Opcode.AUTH_REQUEST, {"phone": phone})
+        verify_token = auth_req["verifyToken"]
+        code_length = auth_req.get("codeLength", 6)
+        print(f"SMS code sent to {phone} ({code_length} digits)")
+
+        # Step 3: Get code from user
+        code = input(f"Enter {code_length}-digit SMS code: ").strip()
+
+        # Step 4: Verify SMS code
+        result = await self._request(Opcode.AUTH, {
+            "token": verify_token,
+            "verifyCode": code,
+            "authTokenType": "CHECK_CODE",
+        })
+
+        # Step 5: Handle 2FA if needed
+        if "passwordChallenge" in result:
+            challenge = result["passwordChallenge"]
+            email = challenge.get("email", "")
+            hint = challenge.get("hint", "")
+            pw = password_callback(email, hint)
+
+            result = await self._request(Opcode.PASSWORD_AUTH, {
+                "trackId": result.get("trackId", ""),
+                "password": pw,
+            })
+
+        # Step 6: Extract token and login
+        token = result["tokenAttrs"]["LOGIN"]["token"]
+        await self.login(token)
+        return token
+
+    async def login_sms(self, phone: str, password: str | None = None) -> dict:
+        """Login via SMS verification code.
+
+        Args:
+            phone: Phone number (e.g. "+79001234567").
+            password: 2FA password. If None, will prompt in terminal.
+
+        Returns:
+            Login response.
+        """
+        def password_callback(email_hint, pw_hint):
+            if password:
+                return password
+            print(f"\n2FA required. Email: {email_hint}")
+            if pw_hint:
+                print(f"Password hint: {pw_hint}")
+            return getpass.getpass("Enter password: ")
+
+        token = await self._login_sms(phone, password_callback)
+        save_token(token, login_token=token, device_id=self._device_id)
+        print("Token saved. Next login will be automatic.")
+        self._start_token_refresh_loop()
+        return await self._request(Opcode.PING, {"interactive": True})
+
     async def refresh_token(self) -> dict:
         """Refresh the session token. Also saves to disk with TTL info."""
         result = await self._request(Opcode.TOKEN_REFRESH, {})
@@ -280,6 +366,132 @@ class MaxClient:
     async def get_folders(self) -> dict:
         """Get chat folders."""
         return await self._request(Opcode.GET_FOLDERS, {"folderSync": 0})
+
+    async def create_chat(
+        self,
+        title: str,
+        member_ids: list[int],
+        chat_type: str = "GROUP",
+    ) -> dict:
+        """Create a new group chat or channel.
+
+        Args:
+            title: Chat title.
+            member_ids: List of user IDs to add.
+            chat_type: "GROUP" or "CHANNEL".
+        """
+        return await self._request(Opcode.CREATE_CHAT, {
+            "title": title,
+            "memberIds": member_ids,
+            "type": chat_type,
+        })
+
+    async def update_chat(
+        self,
+        chat_id: int,
+        title: str | None = None,
+        about: str | None = None,
+    ) -> dict:
+        """Update chat settings (title, description).
+
+        Args:
+            chat_id: Chat ID.
+            title: New title (optional).
+            about: New description (optional).
+        """
+        payload: dict[str, Any] = {"chatId": chat_id}
+        if title is not None:
+            payload["title"] = title
+        if about is not None:
+            payload["about"] = about
+        return await self._request(Opcode.UPDATE_CHAT, payload)
+
+    async def delete_chat(self, chat_id: int) -> dict:
+        """Delete a chat."""
+        return await self._request(Opcode.DELETE_CHAT, {"chatId": chat_id})
+
+    async def join_chat(self, chat_link: str) -> dict:
+        """Join a chat by invite link or public link.
+
+        Args:
+            chat_link: Invite link or public chat link.
+        """
+        return await self._request(Opcode.JOIN_CHAT, {"link": chat_link})
+
+    async def leave_chat(self, chat_id: int) -> dict:
+        """Leave a chat."""
+        return await self._request(Opcode.LEAVE_CHAT, {"chatId": chat_id})
+
+    async def get_chat_members_list(self, chat_id: int) -> dict:
+        """Get list of chat members with roles.
+
+        Args:
+            chat_id: Chat ID.
+
+        Returns:
+            dict with member list and their roles.
+        """
+        return await self._request(Opcode.GET_CHAT_MEMBERS, {"chatId": chat_id})
+
+    async def update_chat_members(
+        self,
+        chat_id: int,
+        add: list[int] | None = None,
+        remove: list[int] | None = None,
+    ) -> dict:
+        """Add or remove members from a chat.
+
+        Args:
+            chat_id: Chat ID.
+            add: List of user IDs to add.
+            remove: List of user IDs to remove.
+        """
+        payload: dict[str, Any] = {"chatId": chat_id}
+        if add:
+            payload["addMemberIds"] = add
+        if remove:
+            payload["removeMemberIds"] = remove
+        return await self._request(Opcode.UPDATE_CHAT_MEMBERS, payload)
+
+    async def clear_chat(self, chat_id: int) -> dict:
+        """Clear all messages in a chat."""
+        return await self._request(Opcode.CLEAR_CHAT, {"chatId": chat_id})
+
+    async def hide_chat(self, chat_id: int) -> dict:
+        """Hide a chat from the chat list."""
+        return await self._request(Opcode.CHAT_HIDE, {"chatId": chat_id})
+
+    async def check_chat_link(self, link: str) -> dict:
+        """Check an invite link without joining. Returns chat info."""
+        return await self._request(Opcode.CHECK_CHAT_LINK, {"link": link})
+
+    async def get_common_chats(self, user_ids: list[int] | int, count: int = 50) -> dict:
+        """Get common chats with other user(s)."""
+        if isinstance(user_ids, int):
+            user_ids = [user_ids]
+        return await self._request(Opcode.GET_COMMON_CHATS, {
+            "userIds": user_ids,
+            "count": count,
+        })
+
+    async def get_folder(self, folder_id: str) -> dict:
+        """Get a chat folder by ID (e.g. "all.chat.folder" or custom ID)."""
+        return await self._request(Opcode.FOLDERS_GET_BY_ID, {"folderId": folder_id})
+
+    async def update_folder(
+        self, folder_id: str, title: str | None = None, chat_ids: list[int] | None = None
+    ) -> dict:
+        """Update a chat folder."""
+        payload: dict[str, Any] = {"folderId": folder_id}
+        if title is not None:
+            payload["title"] = title
+        if chat_ids is not None:
+            payload["chatIds"] = chat_ids
+        return await self._request(Opcode.FOLDERS_UPDATE, payload)
+
+    async def reorder_folders(self, folder_ids: list[str]) -> dict:
+        """Reorder chat folders."""
+        return await self._request(Opcode.FOLDERS_REORDER, {"folderIds": folder_ids})
 
     # ── Messages ────────────────────────────────────────────────
 
@@ -342,28 +554,129 @@ class MaxClient:
         chat_id: int,
         text: str,
         reply_to: str | None = None,
+        elements: list[dict] | None = None,
+        send_time: int | None = None,
     ) -> dict:
-        """Send a text message.
+        """Send a text message with optional formatting.
 
         Args:
             chat_id: Chat ID.
-            text: Message text.
+            text: Message text (plain text, or use parse_formatted_text() for markup).
             reply_to: Message ID to reply to (optional).
+            elements: Formatting elements list. Each element is a dict with:
+                - type: "STRONG" (bold), "EMPHASIZED" (italic), "LINK", "CODE",
+                  "STRIKETHROUGH", "UNDERLINE", "MONOSPACED"
+                - from: character offset in text
+                - length: number of characters
+                - attributes: dict, e.g. {"url": "..."} for LINK type
+                You can use parse_formatted_text() to build text+elements from markup.
+            send_time: Unix timestamp in ms for scheduled sending.
+                If set, the message will be delivered at that time (delayed/scheduled post).
         """
         cid = -int(time.time() * 1000)
-        msg = {
+        msg: dict[str, Any] = {
             "text": text,
             "cid": cid,
-            "elements": [],
+            "elements": elements or [],
             "attaches": [],
         }
         if reply_to:
             msg["replyToMessageId"] = reply_to
+        if send_time:
+            msg["sendTime"] = send_time
 
         return await self._request(Opcode.SEND_MESSAGE, {
             "chatId": chat_id,
             "message": msg,
             "notify": True,
+        })
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: str,
+        text: str,
+        elements: list[dict] | None = None,
+    ) -> dict:
+        """Edit an existing message.
+
+        Args:
+            chat_id: Chat ID.
+            message_id: ID of message to edit.
+            text: New message text.
+            elements: New formatting elements (optional).
+        """
+        return await self._request(Opcode.EDIT_MESSAGE, {
+            "chatId": chat_id,
+            "messageId": message_id,
+            "text": text,
+            "elements": elements or [],
+        })
+
+    async def delete_message(
+        self,
+        chat_id: int,
+        message_id: str | int,
+        for_all: bool = True,
+    ) -> dict:
+        """Delete a message.
+
+        Args:
+            chat_id: Chat ID.
+            message_id: ID of message to delete.
+            for_all: If True, delete for everyone. If False, only for yourself.
+        """
+        return await self._request(Opcode.DELETE_MESSAGE, {
+            "chatId": chat_id,
+            "messageIds": [int(message_id)],
+            "forAll": for_all,
+        })
+
+    async def forward_messages(
+        self,
+        chat_id: int,
+        from_chat_id: int,
+        message_ids: list[str | int],
+    ) -> dict:
+        """Forward messages to another chat.
+
+        Forwards one message at a time using the link mechanism.
+        For multiple messages, sends multiple requests.
+
+        Args:
+            chat_id: Destination chat ID.
+            from_chat_id: Source chat ID.
+            message_ids: List of message IDs to forward.
+        """
+        result = None
+        for mid in message_ids:
+            cid = -int(time.time() * 1000)
+            result = await self._request(Opcode.SEND_MESSAGE, {
+                "chatId": chat_id,
+                "message": {
+                    "cid": cid,
+                    "link": {
+                        "type": "FORWARD",
+                        "chatId": from_chat_id,
+                        "messageId": int(mid),
+                    },
+                },
+                "notify": True,
+            })
+        return result
+
+    async def pin_message(self, chat_id: int) -> dict:
+        """Show the pinned message panel in a chat."""
+        return await self._request(Opcode.CHAT_PIN_SET_VISIBILITY, {
+            "chatId": chat_id,
+            "show": True,
+        })
+
+    async def unpin_message(self, chat_id: int) -> dict:
+        """Hide the pinned message panel in a chat."""
+        return await self._request(Opcode.CHAT_PIN_SET_VISIBILITY, {
+            "chatId": chat_id,
+            "show": False,
         })
 
     async def mark_read(self, chat_id: int, message_id: str) -> dict:
@@ -381,6 +694,60 @@ class MaxClient:
             "chatId": chat_id,
             "type": "TEXT",
         })
+
+    async def get_message(self, chat_id: int, message_ids: list[int] | int) -> dict:
+        """Get messages by IDs.
+
+        Args:
+            chat_id: Chat ID.
+            message_ids: Single message ID (int) or list of message IDs.
+        """
+        if isinstance(message_ids, int):
+            message_ids = [message_ids]
+        return await self._request(Opcode.GET_MESSAGE, {
+            "chatId": chat_id,
+            "messageIds": message_ids,
+        })
+
+    async def search_messages(self, chat_id: int, query: str, count: int = 30) -> dict:
+        """Search messages within a specific chat."""
+        return await self._request(Opcode.SEARCH_MESSAGES, {
+            "chatId": chat_id,
+            "query": query,
+            "count": count,
+        })
+
+    async def search_chats(self, query: str, count: int = 30) -> dict:
+        """Search chats by name."""
+        return await self._request(Opcode.SEARCH_CHATS, {
+            "query": query,
+            "count": count,
+        })
+
+    async def delete_message_range(
+        self, chat_id: int, from_message_id: str, to_message_id: str
+    ) -> dict:
+        """Delete a range of messages in a chat (payload format guessed from APK)."""
+        return await self._request(Opcode.MSG_DELETE_RANGE, {
+            "chatId": chat_id,
+            "fromMessageId": from_message_id,
+            "toMessageId": to_message_id,
+        })
+
+    async def get_message_link(self, chat_id: int, message_id: str) -> dict:
+        """Get a shareable link for a message."""
+        return await self._request(Opcode.GET_MESSAGE_LINK, {
+            "chatId": chat_id,
+            "messageId": message_id,
+        })
+
+    async def get_link_info(self, url: str) -> dict:
+        """Get Open Graph / link preview data for a URL."""
+        return await self._request(Opcode.GET_LINK_INFO, {"link": url})
+
+    async def get_last_mentions(self) -> dict:
+        """Get recent @mentions of the current user."""
+        return await self._request(Opcode.GET_LAST_MENTIONS, {})
 
     # ── File / Photo / Video uploads ─────────────────────────────
 
@@ -463,11 +830,6 @@ class MaxClient:
             ) as resp:
                 resp.raise_for_status()
 
-        # Confirm upload (fire-and-forget, no response expected)
-        try:
-            await self._request(Opcode.CHECK_FILE_UPLOAD, {"fileId": info["fileId"]})
-        except Exception:
-            pass  # Some servers don't support this opcode
         return {"fileId": info["fileId"], "token": info["token"]}
 
     async def send_photo(
@@ -519,6 +881,7 @@ class MaxClient:
             reply_to: Message ID to reply to (optional).
         """
         info = await self._upload_file(file_path)
+        await asyncio.sleep(1)  # Wait for server to process the upload
         cid = -int(time.time() * 1000)
         msg: dict[str, Any] = {
             "cid": cid,
@@ -555,9 +918,10 @@ class MaxClient:
             reply_to: Message ID to reply to (optional).
         """
         info = await self._upload_file(file_path)
+        await asyncio.sleep(1)  # Wait for server to process the upload
         cid = -int(time.time() * 1000)
         attach: dict[str, Any] = {
-            "_type": "AUDIO",
+            "_type": "FILE",
             "fileId": info["fileId"],
         }
         if duration_ms is not None:
@@ -593,10 +957,11 @@ class MaxClient:
             reply_to: Message ID to reply to (optional).
         """
         info = await self._upload_file(file_path)
+        await asyncio.sleep(1)  # Wait for server to process the upload
         cid = -int(time.time() * 1000)
         msg: dict[str, Any] = {
             "cid": cid,
-            "attaches": [{"_type": "VIDEO", "fileId": info["fileId"]}],
+            "attaches": [{"_type": "FILE", "fileId": info["fileId"]}],
         }
         if text:
             msg["text"] = text
@@ -627,11 +992,12 @@ class MaxClient:
             reply_to: Message ID to reply to (optional).
         """
         info = await self._upload_file(file_path)
+        await asyncio.sleep(1)  # Wait for server to process the upload
         cid = -int(time.time() * 1000)
         msg: dict[str, Any] = {
             "cid": cid,
             "attaches": [{
-                "_type": "VIDEO",
+                "_type": "FILE",
                 "fileId": info["fileId"],
                 "videoType": 1,
             }],
@@ -718,46 +1084,105 @@ class MaxClient:
             return []
         return await self.get_contacts(user_ids)
 
-    async def find_user(self, query: str) -> list[dict]:
+    async def find_user(self, query: str, count: int = 30) -> dict:
         """Search for users by name, nickname, or phone.
+
+        Uses contact_search (opcode 37) to search within contacts.
 
         Args:
             query: Search string (name, @nickname, phone number).
-
-        Returns:
-            List of matching user dicts.
+            count: Max results.
         """
-        return await self.search(query, search_type="CONTACT")
+        return await self.contact_search(query, count=count)
+
+    async def contact_add(self, user_id: int) -> dict:
+        """Add a user to contacts."""
+        return await self._request(Opcode.CONTACT_ADD, {"contactId": user_id})
+
+    async def contact_search(self, query: str, count: int = 30) -> dict:
+        """Search within your own contact list."""
+        return await self._request(Opcode.CONTACT_SEARCH, {"query": query, "count": count})
+
+    async def contact_by_phone(self, phone: str) -> dict:
+        """Find a contact by phone number."""
+        return await self._request(Opcode.CONTACT_INFO_BY_PHONE, {"phone": phone})
+
+    async def mutual_contacts(self, user_id: int) -> dict:
+        """Get mutual contacts with another user."""
+        return await self._request(Opcode.CONTACT_MUTUAL, {"userId": user_id})
 
     # ── Search ──────────────────────────────────────────────────
 
     async def search(
-        self, query: str, count: int = 30, search_type: str = "ALL"
+        self, query: str, count: int = 30, search_type: str | None = None
     ) -> list[dict]:
-        """Search contacts and chats.
+        """Public search for chats and channels.
 
         Args:
             query: Search string.
             count: Max results.
-            search_type: "ALL", "CONTACT", "CHAT", or "GROUP".
+            search_type: "ALL", "CHANNELS", or "PUBLIC_CHATS". None for all.
         """
-        result = await self._request(Opcode.SEARCH, {
+        payload: dict[str, Any] = {
             "query": query,
             "count": count,
-            "type": search_type,
-        })
+        }
+        if search_type:
+            payload["type"] = search_type
+        result = await self._request(Opcode.SEARCH, payload)
         return result.get("result", [])
 
-    # ── Reactions ───────────────────────────────────────────────
+    # ── Stats & Reactions ───────────────────────────────────────
+
+    async def get_message_stats(
+        self, chat_id: int, message_ids: list[int] | int
+    ) -> dict:
+        """Get message stats (views count for channel posts).
+
+        Args:
+            chat_id: Chat ID.
+            message_ids: Single message ID (int) or list of message IDs.
+        """
+        if isinstance(message_ids, int):
+            message_ids = [message_ids]
+        return await self._request(Opcode.GET_MESSAGE_STATS, {
+            "chatId": chat_id,
+            "messageIds": message_ids,
+        })
 
     async def get_reactions(
         self, chat_id: int, message_ids: list[str]
     ) -> dict:
-        """Get reactions for messages."""
+        """Get reactions summary for messages.
+
+        Returns:
+            dict with reaction counts per message.
+        """
         return await self._request(Opcode.GET_REACTIONS, {
             "chatId": chat_id,
             "messageIds": message_ids,
         })
+
+    async def get_detailed_reactions(
+        self, chat_id: int, message_id: str, emoji: str | None = None
+    ) -> dict:
+        """Get detailed reactions (who reacted) for a message.
+
+        Args:
+            chat_id: Chat ID.
+            message_id: Message ID.
+            emoji: Filter by specific emoji (optional).
+
+        Returns:
+            dict with list of users who reacted.
+        """
+        payload: dict[str, Any] = {
+            "chatId": chat_id,
+            "messageId": message_id,
+        }
+        if emoji:
+            payload["emoji"] = emoji
+        return await self._request(Opcode.GET_DETAILED_REACTIONS, payload)
 
     # ── Calls ──────────────────────────────────────────────────
 
@@ -891,6 +1316,104 @@ class MaxClient:
             "messageId": message_id,
         })
 
+    # ── Reactions ─────────────────────────────────────────────
+
+    async def react(
+        self, chat_id: int, message_id: str | int, emoji: str
+    ) -> dict:
+        """Add a reaction to a message.
+
+        Args:
+            chat_id: Chat ID.
+            message_id: Message ID.
+            emoji: Reaction emoji (e.g. "👍", "❤️", "⚡️").
+        """
+        return await self._request(Opcode.REACT, {
+            "chatId": chat_id,
+            "messageId": int(message_id),
+            "reaction": {
+                "reactionType": "EMOJI",
+                "id": emoji,
+            },
+        })
+
+    async def remove_reaction(
+        self, chat_id: int, message_id: str | int
+    ) -> dict:
+        """Remove your reaction from a message."""
+        return await self._request(Opcode.CANCEL_REACTION, {
+            "chatId": chat_id,
+            "messageId": int(message_id),
+        })
+
+    async def set_chat_reaction_settings(
+        self, chat_id: int, emojis: list[str]
+    ) -> dict:
+        """Set allowed reaction emojis for a chat."""
+        return await self._request(Opcode.CHAT_REACTIONS_SETTINGS_SET, {
+            "chatId": chat_id,
+            "emojis": emojis,
+        })
+
+    async def get_chat_reaction_settings(self, chat_ids: list[int] | int) -> dict:
+        """Get reaction settings for chat(s)."""
+        if isinstance(chat_ids, int):
+            chat_ids = [chat_ids]
+        return await self._request(Opcode.REACTIONS_SETTINGS_GET_BY_CHAT_ID, {
+            "chatIds": chat_ids,
+        })
+
+    # ── Social ───────────────────────────────────────────────
+
+    async def get_user_score(self, user_id: int) -> dict:
+        """Get user's score/karma."""
+        return await self._request(Opcode.GET_USER_SCORE, {"contactId": user_id})
+
+    async def complain_reasons(self) -> dict:
+        """Get list of available complaint reasons."""
+        return await self._request(Opcode.COMPLAIN_REASONS_GET, {"complainSync": 0})
+
+    # ── Sessions ─────────────────────────────────────────────
+
+    async def get_sessions(self) -> dict:
+        """Get list of active sessions (devices)."""
+        return await self._request(Opcode.GET_SESSIONS, {})
+
+    async def close_session(self, session_id: str) -> dict:
+        """Close/terminate another session.
+
+        Args:
+            session_id: Session ID to close.
+        """
+        return await self._request(Opcode.CLOSE_SESSION, {
+            "sessionId": session_id,
+        })
+
+    # ── Drafts ──────────────────────────────────────────────
+
+    async def save_draft(self, chat_id: int, text: str) -> dict:
+        """Save a draft message for a chat.
+
+        Args:
+            chat_id: Chat ID.
+            text: Draft text.
+        """
+        return await self._request(Opcode.DRAFT_SAVE, {
+            "chatId": chat_id,
+            "draft": {
+                "text": text,
+                "elements": [],
+                "attaches": [],
+            },
+        })
+
+    async def discard_draft(self, chat_id: int) -> dict:
+        """Discard the draft for a chat."""
+        return await self._request(Opcode.DRAFT_DISCARD, {
+            "chatId": chat_id,
+            "time": 0,
+        })
+
     # ── Events ──────────────────────────────────────────────────
 
     def on_message(self, callback: Callable[[dict], Any]):
@@ -904,6 +1427,42 @@ class MaxClient:
     def on_call(self, callback: Callable[[dict], Any]):
         """Register handler for incoming calls (opcode 137)."""
         self._handlers.setdefault(Opcode.PUSH_INCOMING_CALL, []).append(callback)
+
+    def on_typing(self, callback: Callable[[dict], Any]):
+        """Register handler for typing indicators (opcode 129)."""
+        self._handlers.setdefault(Opcode.PUSH_TYPING, []).append(callback)
+
+    def on_chat_update(self, callback: Callable[[dict], Any]):
+        """Register handler for chat updates (opcode 135)."""
+        self._handlers.setdefault(Opcode.PUSH_CHAT, []).append(callback)
+
+    def on_delayed_message(self, callback: Callable[[dict], Any]):
+        """Register handler for delayed/scheduled message updates (opcode 154)."""
+        self._handlers.setdefault(Opcode.PUSH_MSG_DELAYED, []).append(callback)
+
+    def on_reactions(self, callback: Callable[[dict], Any]):
+        """Register handler for reaction changes (opcode 155)."""
+        self._handlers.setdefault(Opcode.PUSH_REACTIONS_CHANGED, []).append(callback)
+
+    def on_mark(self, callback: Callable[[dict], Any]):
+        """Register handler for read receipts from other sessions (opcode 130)."""
+        self._handlers.setdefault(Opcode.PUSH_MARK, []).append(callback)
+
+    def on_contact(self, callback: Callable[[dict], Any]):
+        """Register handler for contact list changes (opcode 131)."""
+        self._handlers.setdefault(Opcode.PUSH_CONTACT, []).append(callback)
+
+    def on_location(self, callback: Callable[[dict], Any]):
+        """Register handler for location sharing updates (opcode 147)."""
+        self._handlers.setdefault(Opcode.PUSH_LOCATION, []).append(callback)
+
+    def on_folder_update(self, callback: Callable[[dict], Any]):
+        """Register handler for folder changes (opcode 277)."""
+        self._handlers.setdefault(Opcode.PUSH_FOLDERS, []).append(callback)
+
+    def on_delete_range(self, callback: Callable[[dict], Any]):
+        """Register handler for batch message deletions (opcode 140)."""
+        self._handlers.setdefault(Opcode.PUSH_MSG_DELETE_RANGE, []).append(callback)
 
     def on(self, opcode: int, callback: Callable[[dict], Any]):
         """Register handler for any server push opcode."""
@@ -997,6 +1556,102 @@ class MaxClient:
                     await result
             except Exception as e:
                 print(f"Handler error for opcode {opcode}: {e}")
+
+
+def parse_formatted_text(text: str) -> tuple[str, list[dict]]:
+    """Parse text with simple markup into plain text + MAX elements.
+
+    Supported markup:
+        **bold**           → STRONG
+        *italic*           → EMPHASIZED
+        ***bold italic***  → STRONG + EMPHASIZED
+        ~~strikethrough~~  → STRIKETHROUGH
+        ++underline++      → UNDERLINE
+        ^^highlighted^^    → HIGHLIGHTED
+        `code`             → MONOSPACED
+        [link text](url)   → LINK with url
+
+    Returns:
+        (plain_text, elements) tuple ready for send_message().
+
+    Example:
+        text, elements = parse_formatted_text("Hello **world** and [click here](https://example.com)")
+        await client.send_message(chat_id, text, elements=elements)
+    """
+    import re
+
+    elements = []
+    result = []
+    pos = 0
+
+    markup_re = re.compile(
+        r'\*\*\*(.+?)\*\*\*'    # group 1: bold+italic content
+        r'|\*\*(.+?)\*\*'        # group 2: bold content
+        r'|\*(.+?)\*'            # group 3: italic content
+        r'|~~(.+?)~~'            # group 4: strikethrough content
+        r'|\+\+(.+?)\+\+'       # group 5: underline content
+        r'|\^\^(.+?)\^\^'       # group 6: highlighted content
+        r'|`(.+?)`'              # group 7: code/monospaced content
+        r'|\[(.+?)\]\((.+?)\)'   # group 8: link text, group 9: url
+    )
+
+    for match in markup_re.finditer(text):
+        if match.start() > pos:
+            result.append(text[pos:match.start()])
+        pos = match.end()
+
+        if match.group(1) is not None:  # ***bold italic***
+            content = match.group(1)
+            offset = sum(len(r) for r in result)
+            elements.append({"type": "STRONG", "from": offset, "length": len(content)})
+            elements.append({"type": "EMPHASIZED", "from": offset, "length": len(content)})
+            result.append(content)
+        elif match.group(2) is not None:  # **bold**
+            content = match.group(2)
+            offset = sum(len(r) for r in result)
+            elements.append({"type": "STRONG", "from": offset, "length": len(content)})
+            result.append(content)
+        elif match.group(3) is not None:  # *italic*
+            content = match.group(3)
+            offset = sum(len(r) for r in result)
+            elements.append({"type": "EMPHASIZED", "from": offset, "length": len(content)})
+            result.append(content)
+        elif match.group(4) is not None:  # ~~strikethrough~~
+            content = match.group(4)
+            offset = sum(len(r) for r in result)
+            elements.append({"type": "STRIKETHROUGH", "from": offset, "length": len(content)})
+            result.append(content)
+        elif match.group(5) is not None:  # ++underline++
+            content = match.group(5)
+            offset = sum(len(r) for r in result)
+            elements.append({"type": "UNDERLINE", "from": offset, "length": len(content)})
+            result.append(content)
+        elif match.group(6) is not None:  # ^^highlighted^^
+            content = match.group(6)
+            offset = sum(len(r) for r in result)
+            elements.append({"type": "HIGHLIGHTED", "from": offset, "length": len(content)})
+            result.append(content)
+        elif match.group(7) is not None:  # `code`
+            content = match.group(7)
+            offset = sum(len(r) for r in result)
+            elements.append({"type": "MONOSPACED", "from": offset, "length": len(content)})
+            result.append(content)
+        elif match.group(8) is not None:  # [text](url)
+            content = match.group(8)
+            url = match.group(9)
+            offset = sum(len(r) for r in result)
+            elements.append({
+                "type": "LINK",
+                "from": offset,
+                "length": len(content),
+                "attributes": {"url": url},
+            })
+            result.append(content)
+
+    if pos < len(text):
+        result.append(text[pos:])
+
+    return ''.join(result), elements
 
 
 class MaxAPIError(Exception):
